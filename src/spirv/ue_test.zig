@@ -862,3 +862,87 @@ test "out arguments of atomics and sincos are values, not locals" {
     try expectEqual(@as(usize, 1), countOp(m, 234)); // OpAtomicIAdd
     try expectEqual(@as(usize, 1), countOp(m, 230)); // OpAtomicCompareExchange
 }
+
+/// The Aligned literals of loads (OpLoad) or stores (OpStore) through
+/// PhysicalStorageBuffer pointers, in order.
+fn physicalAlignments(a: std.mem.Allocator, m: Module, op: u16) ![]const u32 {
+    var psb_ptrs: std.AutoHashMapUnmanaged(u32, void) = .empty; // pointer types
+    var ptrs: std.AutoHashMapUnmanaged(u32, void) = .empty; // values of them
+    var out: std.ArrayList(u32) = .empty;
+    var it = m.ops();
+    while (it.next()) |i| switch (i.op) {
+        32 => if (i.args[1] == 5349) try psb_ptrs.put(a, i.args[0], {}), // OpTypePointer PhysicalStorageBuffer
+        124 => if (psb_ptrs.contains(i.args[0])) try ptrs.put(a, i.args[1], {}), // OpBitcast
+        61, 62 => if (i.op == op) {
+            const p = if (op == 61) i.args[2] else i.args[0];
+            const mem = if (op == 61) i.args[3..] else i.args[2..];
+            if (ptrs.contains(p) and mem.len == 2 and mem[0] == 2) try out.append(a, mem[1]); // Aligned
+        },
+        else => {},
+    };
+    return out.items;
+}
+
+test "vk::RawBufferLoad / RawBufferStore: PhysicalStorageBuffer pointers from addresses" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src =
+        \\struct T { float a; float3 b; bool c; };
+        \\struct PC { uint64_t addr; };
+        \\[[vk::push_constant]] PC pc;
+        \\[numthreads(1,1,1)] void main() {
+        \\  float4 v = vk::RawBufferLoad<float4>(pc.addr, 16);
+        \\  T t = vk::RawBufferLoad<T>(pc.addr + 16);
+        \\  uint x = vk::RawBufferLoad(pc.addr + 64);
+        \\  vk::RawBufferStore(pc.addr + 64, x + 1);
+        \\  uint y = vk::RawBufferLoad(pc.addr + 64);
+        \\  t.c = !t.c;
+        \\  vk::RawBufferStore<T>(pc.addr + 80, t, 8);
+        \\  vk::RawBufferStore<float4>(pc.addr + 112, v * (x + y), 16);
+        \\}
+    ;
+    const m = try ok(a, "cs_6_0", &.{}, src);
+    var it = m.ops();
+    var caps: usize = 0;
+    var addressing: ?u32 = null;
+    while (it.next()) |i| switch (i.op) {
+        17 => if (i.args[0] == 5347) {
+            caps += 1; // OpCapability PhysicalStorageBufferAddresses
+        },
+        14 => addressing = i.args[0], // OpMemoryModel
+        else => {},
+    };
+    try expectEqual(@as(usize, 1), caps);
+    try expectEqual(@as(?u32, 5348), addressing); // PhysicalStorageBuffer64
+    // Both loads of pc.addr + 64 stay: the store between them changes it.
+    try std.testing.expectEqualSlices(u32, &.{ 16, 4, 4, 4 }, try physicalAlignments(a, m, 61));
+    try std.testing.expectEqualSlices(u32, &.{ 4, 8, 16 }, try physicalAlignments(a, m, 62));
+    // Scalar layout (as dxc, whatever the layout options), the bool a uint.
+    const t = m.named("T").?;
+    try expectEqual(@as(?u32, 4), m.memberDeco(t, 1, offset));
+    try expectEqual(@as(?u32, 16), m.memberDeco(t, 2, offset));
+    const gl = try ok(a, "cs_6_0", &.{"-fvk-use-gl-layout"}, src);
+    try expectEqual(@as(?u32, 4), gl.memberDeco(gl.named("T").?, 1, offset));
+}
+
+test "vk::RawBufferLoad / RawBufferStore: alignments are constant powers of two, reported where written" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const pre = "struct PC { uint64_t addr; uint al; }; [[vk::push_constant]] PC pc; static const uint A = 16;\n";
+    const dynamic = try spirv(a, "cs_6_0", &.{}, pre ++ "[numthreads(1,1,1)] void main() { vk::RawBufferStore(pc.addr, vk::RawBufferLoad(pc.addr, pc.al)); }");
+    try std.testing.expect(dynamic.m == null);
+    try std.testing.expect(std.mem.startsWith(u8, dynamic.diagnostics, "hlsl.hlsl:2:90: error: alignment argument must be a constant unsigned integer"));
+    const odd = try spirv(a, "cs_6_0", &.{}, pre ++ "[numthreads(1,1,1)] void main() { vk::RawBufferStore(pc.addr, 1u, 3); }");
+    try std.testing.expect(odd.m == null);
+    try std.testing.expect(std.mem.startsWith(u8, odd.diagnostics, "hlsl.hlsl:2:67: error: alignment argument must be a power of two"));
+    // Floats and bools are not integers, even when they convert to one.
+    for ([_][]const u8{ "16.5", "16.0", "true" }) |al| {
+        const r = try spirv(a, "cs_6_0", &.{}, try std.fmt.allocPrint(a, "{s}[numthreads(1,1,1)] void main() {{ vk::RawBufferStore(pc.addr, 1u, {s}); }}", .{ pre, al }));
+        try std.testing.expect(r.m == null);
+        try std.testing.expect(std.mem.startsWith(u8, r.diagnostics, "hlsl.hlsl:2:67: error: alignment argument must be a constant unsigned integer"));
+    }
+    // Constant expressions, not only literals.
+    _ = try ok(a, "cs_6_0", &.{}, pre ++ "[numthreads(1,1,1)] void main() { vk::RawBufferStore(pc.addr, vk::RawBufferLoad(pc.addr, A), A / 2 * sizeof(uint)); }");
+}

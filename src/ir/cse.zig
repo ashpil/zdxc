@@ -9,9 +9,10 @@
 //! arrays and recompute the same products; left apart, they are a large
 //! share of what its spirv-opt then spends its time on.
 //!
-//! Loads count only from constant buffers (nothing writes them). Wave,
-//! quad and derivative operations, whose results depend on which lanes
-//! run them, are never merged.
+//! Loads count only from constant buffers (nothing writes them), never
+//! through addresses (vk::RawBufferLoad, which a store may change). Wave,
+//! quad and derivative operations and clock reads, whose results depend on
+//! which lanes run them (or when), are never merged.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -38,9 +39,15 @@ fn successors(a: Allocator, term: ir.Terminator) Allocator.Error![]const BlockId
 
 /// Intrinsics whose value depends on the lanes running them (or on when).
 fn lanesDependent(name: []const u8) bool {
-    const prefixes = [_][]const u8{ "Wave", "Quad", "ddx", "ddy", "fwidth", "Evaluate", "GetAttributeAtVertex", "Clock", "clock" };
+    const prefixes = [_][]const u8{ "Wave", "Quad", "ddx", "ddy", "fwidth", "Evaluate", "GetAttributeAtVertex", "ReadClock" };
     for (prefixes) |p| if (std.mem.startsWith(u8, name, p)) return true;
     return false;
+}
+
+/// Intrinsics reading memory a store may change (vk::RawBufferLoad):
+/// removable when unused, but two with the same address may differ.
+fn readsMemory(name: []const u8) bool {
+    return std.mem.eql(u8, name, "RawBufferLoad");
 }
 
 const Key = struct {
@@ -126,7 +133,7 @@ fn keyOf(a: Allocator, f: *const ir.Function, inst: ir.Inst) Allocator.Error!?[]
             try k.ref(x.f);
         },
         .intrinsic => |x| {
-            if (lanesDependent(x.name) or !opt.isPureIntrinsic(f, x.name, x.args)) return null;
+            if (lanesDependent(x.name) or readsMemory(x.name) or !opt.isPureIntrinsic(f, x.name, x.args)) return null;
             try k.bytes(x.name);
             for (x.args) |r| try k.ref(r);
         },

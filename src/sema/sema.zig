@@ -3874,8 +3874,21 @@ pub const Sema = struct {
                 const loc = if (e.kind == .call and i < e.kind.call.args.len) startLoc(e.kind.call.args[i]) else a.loc;
                 s.warn(loc, "conversion", "implicit truncation of vector type", .{});
             }
+            if (s.opts.spirv and isVkQualified(callee) and e.kind == .call) s.checkRawBufferAlignment(name, e.kind.call.args);
         }
         return rvalue(r.ret);
+    }
+
+    /// vk::RawBufferLoad(addr, alignment) / RawBufferStore(addr, value,
+    /// alignment): the alignment is a constant (as in dxc) power of two (an
+    /// Aligned memory operand must be one).
+    fn checkRawBufferAlignment(s: *Sema, name: []const u8, args: []const *ast.Expr) void {
+        const at: usize = if (std.mem.eql(u8, name, "RawBufferLoad")) 1 else if (std.mem.eql(u8, name, "RawBufferStore")) 2 else return;
+        if (args.len <= at) return;
+        const loc = startLoc(args[at]);
+        const c = s.evalConst(args[at]);
+        const v = if (c != null and c.? == .int) c.?.int else return s.err(loc, "alignment argument must be a constant unsigned integer", .{});
+        if (v <= 0 or v > std.math.maxInt(u32) or !std.math.isPowerOfTwo(v)) s.err(loc, "alignment argument must be a power of two", .{});
     }
 
     /// The cost of calling `f` with `args`, or null if it cannot take them.

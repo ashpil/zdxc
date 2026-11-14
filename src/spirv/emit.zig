@@ -4988,6 +4988,27 @@ const Emitter = struct {
         return 0;
     }
 
+    /// vk::RawBufferLoad<T>(addr[, alignment]) (`value` null) and
+    /// vk::RawBufferStore<T>(addr, value[, alignment]): the address as a
+    /// PhysicalStorageBuffer pointer to T, laid out by scalar rules (dxc's,
+    /// whatever the -fvk-*-layout options), accessed with an Aligned memory
+    /// operand (4 by default). Bools are stored as uints.
+    fn rawBufferAccess(e: *Emitter, ty: TypeId, addr: Ref, alignment: ?Ref, value: ?Ref) Error!Id {
+        // (Sema reports alignments that are not constant powers of two.)
+        const al: u32 = if (alignment) |r| switch (e.f.inst(r).op) {
+            .constant => |c| if (c == .int and c.int > 0 and c.int <= std.math.maxInt(u32)) @intCast(c.int) else return e.unsupported("this vk::RawBuffer alignment", .{}),
+            else => return e.unsupported("this vk::RawBuffer alignment", .{}),
+        } else 4;
+        try e.inlineCap(5347); // PhysicalStorageBufferAddresses
+        const lt = try e.layoutTypeId(ty, .scalar, false);
+        const ptr = try e.opRaw(.bitcast, try e.pointerType(.physical_storage_buffer, lt), &.{e.val(addr)});
+        if (value) |v| {
+            try e.b.emit(.functions, .store, &.{ ptr, try e.toLayout(e.val(v), ty, .scalar, false), 2, al }); // Aligned
+            return 0;
+        }
+        return e.fromLayout(try e.opRaw(.load, lt, &.{ ptr, 2, al }), ty, .scalar, false);
+    }
+
     fn intrinsic(e: *Emitter, name: []const u8, ty: TypeId, args: []const Ref) Error!Id {
         if (try e.outIntrinsic(name, ty, args)) |id| return id;
         if (std.mem.startsWith(u8, name, "Wave") or std.mem.startsWith(u8, name, "Quad")) {
@@ -5002,6 +5023,8 @@ const Emitter = struct {
             try e.nonuniform_ids.put(e.arena, id, {});
             return id;
         }
+        if (std.mem.eql(u8, name, "RawBufferLoad")) return e.rawBufferAccess(ty, args[0], if (args.len > 1) args[1] else null, null);
+        if (std.mem.eql(u8, name, "RawBufferStore")) return e.rawBufferAccess(e.f.inst(args[1]).ty, args[0], if (args.len > 2) args[2] else null, args[1]);
         const ids = try e.arena.alloc(u32, args.len);
         const tys = try e.arena.alloc(TypeId, args.len);
         for (args, ids, tys) |a, *id, *t| {
