@@ -10,6 +10,13 @@
 //! Value types are Sema's TypeTable ids (scalars, vectors, matrices,
 //! arrays, structs, resources). A value whose `ptr` space is not `.none` is
 //! a pointer to storage of that type.
+//!
+//! A matrix's orientation (row_major / column_major) is how memory stores
+//! it, so only memory has one: pointers' types, globals' and the bindings
+//! resources come from (a global, a `heap_resource`'s `decl`) are as
+//! declared; values' types are canonical (`verify` checks). A buffer's
+//! layout is its binding's: a resource value, wherever it went, views the
+//! buffer it was bound to.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -38,8 +45,9 @@ pub const BlockId = enum(u32) {
 };
 
 /// Where a pointer points.
-/// (`node`: a work graph node record.)
-pub const Space = enum { none, function, private, groupshared, resource, input, output, cbuffer, mesh, ray, node };
+/// (`node`: a work graph node record; `physical`: memory at a 64-bit
+/// device address.)
+pub const Space = enum { none, function, private, groupshared, resource, input, output, cbuffer, mesh, ray, node, physical };
 
 /// Ray tracing shader storage an entry receives: the incoming payload,
 /// the hit attributes and the incoming callable data.
@@ -82,6 +90,11 @@ pub const Op = union(enum) {
     global: u32,
     /// Function-local storage of the result type (result is a pointer).
     local_var,
+    /// Pointer (`physical` space) to the result type's storage at the
+    /// 64-bit device address `addr` (vk::RawBufferLoad / RawBufferStore),
+    /// whose loads and stores are aligned to `alignment` bytes (the result
+    /// type, its matrices oriented, lays the memory out).
+    address: struct { addr: Ref, alignment: u32 },
     load: Ref,
     store: struct { ptr: Ref, value: Ref },
     /// Pointer to a member / element of the storage `base` points at.
@@ -128,8 +141,10 @@ pub const Op = union(enum) {
     mesh_output: MeshOutput,
     mesh_payload,
     /// `ResourceDescriptorHeap[index]` / `SamplerDescriptorHeap[index]`
-    /// as a resource of the instruction's type.
-    heap_resource: struct { index: Ref, sampler: bool },
+    /// as a resource of the instruction's type, bound as `decl`: the type
+    /// it is declared as where it converts to one (its buffer's matrices
+    /// oriented, as a global's are; the instruction's type is canonical).
+    heap_resource: struct { index: Ref, sampler: bool, decl: TypeId },
     /// Ray tracing entries: pointer (`ray` space) to the storage of an
     /// incoming value of the instruction's type.
     ray_incoming: RayIncoming,
@@ -152,6 +167,9 @@ pub const Op = union(enum) {
 
 pub const Inst = struct {
     op: Op,
+    /// A value's type is canonical (TypeTable.canonical): values have no
+    /// storage order. A pointer's is the type of the memory it points at,
+    /// as declared, its matrices oriented as the memory stores them.
     ty: TypeId,
     /// Non-`none` when the result is a pointer to `ty` storage.
     ptr: Space = .none,
@@ -406,8 +424,6 @@ pub const SigElement = struct {
     ty: TypeId,
     system_value: bool,
     interp: types.Interp = .{},
-    /// Matrices in the element are row_major (signature layout only).
-    row_major: bool = false,
     /// Geometry shader output stream.
     stream: u32 = 0,
     /// One value per vertex of the input primitive (geometry shaders).
@@ -615,9 +631,8 @@ pub const Module = struct {
     resource_structs: bool = false,
     /// -enable-16bit-types: half and 16-bit integers are native types.
     native_16bit: bool = false,
-    /// -Zpr: matrices that are structured buffer elements themselves
-    /// (not fields, which carry their own orientation) are row_major.
-    /// DXIL only: dxc's SPIR-V keeps those column_major.
+    /// -Zpr. (DXIL structured buffers store matrix elements, and arrays of
+    /// them, this way whatever their declarations say, as dxc's DXIL.)
     row_major: bool = false,
     /// Root signatures: version 1.0 or 1.1 (-force-rootsig-ver), and
     /// -Qstrip_rootsignature.
@@ -652,8 +667,11 @@ pub const Builder = struct {
         return b.cur != .none and b.f.block(b.cur).term == .none;
     }
 
+    /// (A value's type is made canonical: see Inst.ty.)
     pub fn add(b: *Builder, inst: Inst) !Ref {
-        try b.f.insts.append(b.m.arena, inst);
+        var x = inst;
+        if (x.ptr == .none) x.ty = b.m.types.canonical(x.ty);
+        try b.f.insts.append(b.m.arena, x);
         const r: Ref = @fromBackingInt(@intCast(b.f.insts.items.len - 1));
         // Instructions after a terminator (dead code) go to a fresh block.
         if (!b.open()) b.cur = try b.newBlock();
@@ -683,6 +701,23 @@ pub const Builder = struct {
         _ = try b.add(.{ .op = .{ .store = .{ .ptr = ptr, .value = value } }, .ty = TypeTable.void_type });
     }
 };
+
+/// Checks (in safe builds) that values' types are canonical: the
+/// instructions' (all of them: the emitters declare constants and undefs
+/// wherever they are), and the parameters' and return values' passed by
+/// value. See Inst.ty.
+pub fn verify(m: *const Module) void {
+    if (!std.debug.runtime_safety) return;
+    const t = m.types;
+    for (m.functions.items) |f| {
+        if (f.dead) continue;
+        if (t.canonical(f.ret) != f.ret) std.debug.panic("IR: {s} returns a value of an oriented type", .{f.name});
+        for (f.params) |p| if (!p.by_ref and t.canonical(p.ty) != p.ty) std.debug.panic("IR: {s}'s parameter {s} is a value of an oriented type", .{ f.name, p.name });
+        for (f.insts.items, 0..) |i, k| {
+            if (i.ptr == .none and t.canonical(i.ty) != i.ty) std.debug.panic("IR: %{d} ({s}) in {s} is a value of an oriented type", .{ k, @tagName(i.op), f.name });
+        }
+    }
+}
 
 /// Prints a module in a readable text form (for `-zdxc-ir` and tests).
 pub fn dump(m: *const Module, w: *std.Io.Writer) !void {
@@ -781,6 +816,7 @@ fn dumpInst(m: *const Module, f: *const Function, r: Ref, w: *std.Io.Writer) !vo
         .spec_constant => |k| try w.print("spec constant {d}", .{k}),
         .spirv_inst => |x| try w.print("spirv op {d}", .{x.opcode}),
         .heap_resource => |h| try w.print("{s}[%{d}]", .{ if (h.sampler) "SamplerDescriptorHeap" else "ResourceDescriptorHeap", h.index.index() }),
+        .address => |x| try w.print("address %{d} aligned {d}", .{ x.addr.index(), x.alignment }),
         .patch_output => |x| try w.print("patch output {d} = %{d}", .{ x.element, x.value.index() }),
         .output_vertex => |x| try w.print("output {d} vertex {d}", .{ x.element, x.vertex }),
         .cut => |k| try w.print("cut stream {d}", .{k}),

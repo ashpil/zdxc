@@ -143,7 +143,7 @@ const Pass = struct {
             if (isRefResource(p.t, prm)) {
                 if (prm.dir == .inout) {
                     info.ref_in[k] = @intCast(params.items.len);
-                    try params.append(p.a, .{ .name = prm.name, .ty = prm.ty, .by_ref = false, .sema_ty = prm.ty });
+                    try params.append(p.a, .{ .name = prm.name, .ty = p.t.canonical(prm.ty), .by_ref = false, .sema_ty = prm.ty });
                 }
                 continue;
             }
@@ -151,13 +151,17 @@ const Pass = struct {
             info.leaf_params[k] = @intCast(params.items.len);
             var leaves: std.ArrayList(TypeId) = .empty;
             try leafTypes(p.a, p.t, prm.ty, &leaves);
-            for (leaves.items, 0..) |lt, n| try params.append(p.a, .{ .name = try std.fmt.allocPrint(p.a, "{s}.{d}", .{ prm.name, n }), .ty = lt, .by_ref = false, .sema_ty = lt });
+            for (leaves.items, 0..) |lt, n| try params.append(p.a, .{ .name = try std.fmt.allocPrint(p.a, "{s}.{d}", .{ prm.name, n }), .ty = p.t.canonical(lt), .by_ref = false, .sema_ty = lt });
         }
         f.params = params.items;
     }
 
-    fn add(f: *ir.Function, a: Allocator, inst: ir.Inst) Allocator.Error!Ref {
-        try f.insts.append(a, inst);
+    /// (A value's type is made canonical: leaves get their types from
+    /// struct fields and globals, as declared. See ir.Inst.ty.)
+    fn add(p: *Pass, f: *ir.Function, inst: ir.Inst) Allocator.Error!Ref {
+        var x = inst;
+        if (x.ptr == .none) x.ty = p.t.canonical(x.ty);
+        try f.insts.append(p.a, x);
         return @enumFromInt(f.insts.items.len - 1);
     }
 
@@ -168,7 +172,7 @@ const Pass = struct {
         try leafTypes(p.a, p.t, ty, &lts);
         const vals = try p.a.alloc(Ref, lts.items.len);
         for (vals, lts.items, 0..) |*v, lt, n| {
-            v.* = try add(f, p.a, .{ .op = .{ .param = first + @as(u32, @intCast(n)) }, .ty = lt });
+            v.* = try p.add(f, .{ .op = .{ .param = first + @as(u32, @intCast(n)) }, .ty = lt });
             try out.append(p.a, v.*);
         }
         if (old.ptr != .none) {
@@ -176,9 +180,9 @@ const Pass = struct {
             // from the leaf parameters.
             const ptrs = try p.a.alloc(Ref, vals.len);
             for (ptrs, vals, lts.items) |*pp, v, lt| {
-                pp.* = try add(f, p.a, .{ .op = .local_var, .ty = lt, .ptr = .function });
+                pp.* = try p.add(f, .{ .op = .local_var, .ty = lt, .ptr = .function });
                 try out.append(p.a, pp.*);
-                try out.append(p.a, try add(f, p.a, .{ .op = .{ .store = .{ .ptr = pp.*, .value = v } }, .ty = TypeTable.void_type }));
+                try out.append(p.a, try p.add(f, .{ .op = .{ .store = .{ .ptr = pp.*, .value = v } }, .ty = TypeTable.void_type }));
             }
             try pleaves.put(p.a, r, ptrs);
         } else try leaves.put(p.a, r, vals);
@@ -242,9 +246,9 @@ const Pass = struct {
                         try out.append(p.a, r);
                         try ref_locals.put(p.a, pi, r);
                         if (info.ref_in[pi]) |in| {
-                            const v = try add(f, p.a, .{ .op = .{ .param = in }, .ty = ty });
+                            const v = try p.add(f, .{ .op = .{ .param = in }, .ty = ty });
                             try out.append(p.a, v);
-                            const st = try add(f, p.a, .{ .op = .{ .store = .{ .ptr = r, .value = v } }, .ty = TypeTable.void_type });
+                            const st = try p.add(f, .{ .op = .{ .store = .{ .ptr = r, .value = v } }, .ty = TypeTable.void_type });
                             try out.append(p.a, st);
                             try ref_init.put(p.a, st, {});
                         }
@@ -256,7 +260,7 @@ const Pass = struct {
                         try leafTypes(p.a, p.t, ty, &lts);
                         const ptrs = try p.a.alloc(Ref, lts.items.len);
                         for (ptrs, lts.items) |*pp, lt| {
-                            pp.* = try add(f, p.a, .{ .op = .local_var, .ty = lt, .ptr = .function });
+                            pp.* = try p.add(f, .{ .op = .local_var, .ty = lt, .ptr = .function });
                             try out.append(p.a, pp.*);
                         }
                         try pleaves.put(p.a, r, ptrs);
@@ -286,7 +290,7 @@ const Pass = struct {
                         try out.append(p.a, r);
                         const vals = try p.a.alloc(Ref, pl.len);
                         for (vals, pl) |*v, pp| {
-                            v.* = try add(f, p.a, .{ .op = .{ .load = pp }, .ty = f.insts.items[pp.index()].ty });
+                            v.* = try p.add(f, .{ .op = .{ .load = pp }, .ty = f.insts.items[pp.index()].ty });
                             try out.append(p.a, v.*);
                         }
                         try leaves.put(p.a, r, vals);
@@ -295,7 +299,7 @@ const Pass = struct {
                     .store => |st| if (pleaves.get(st.ptr)) |pl| {
                         try out.append(p.a, r);
                         const vals = leaves.get(st.value) orelse return p.fail("storing this value holding resources", .{});
-                        for (pl, vals) |pp, v| try out.append(p.a, try add(f, p.a, .{ .op = .{ .store = .{ .ptr = pp, .value = v } }, .ty = TypeTable.void_type }));
+                        for (pl, vals) |pp, v| try out.append(p.a, try p.add(f, .{ .op = .{ .store = .{ .ptr = pp, .value = v } }, .ty = TypeTable.void_type }));
                         continue;
                     },
                     .construct => |parts| if (holdsResources(p.t, ty)) {
@@ -348,7 +352,7 @@ const Pass = struct {
                         for (c.args, 0..) |arg, k| {
                             if (k < ci.ref_in.len) if (ci.ref_in[k] != null) {
                                 // An inout resource's value goes in.
-                                const v = try add(f, p.a, .{ .op = .{ .load = arg }, .ty = f.insts.items[arg.index()].ty });
+                                const v = try p.add(f, .{ .op = .{ .load = arg }, .ty = f.insts.items[arg.index()].ty });
                                 try out.append(p.a, v);
                                 try args.append(p.a, v);
                                 continue;
@@ -358,7 +362,7 @@ const Pass = struct {
                                 try args.appendSlice(p.a, vals);
                             } else if (pleaves.get(arg)) |pl| {
                                 for (pl) |pp| {
-                                    const v = try add(f, p.a, .{ .op = .{ .load = pp }, .ty = f.insts.items[pp.index()].ty });
+                                    const v = try p.add(f, .{ .op = .{ .load = pp }, .ty = f.insts.items[pp.index()].ty });
                                     try out.append(p.a, v);
                                     try args.append(p.a, v);
                                 }
@@ -376,14 +380,14 @@ const Pass = struct {
                             const v = switch (src) {
                                 .param => |pi| args.items[pi],
                                 .global => |g| blk: {
-                                    const gp = try add(f, p.a, .{ .op = .{ .global = g }, .ty = at, .ptr = .resource });
+                                    const gp = try p.add(f, .{ .op = .{ .global = g }, .ty = at, .ptr = .resource });
                                     try out.append(p.a, gp);
-                                    const l = try add(f, p.a, .{ .op = .{ .load = gp }, .ty = at });
+                                    const l = try p.add(f, .{ .op = .{ .load = gp }, .ty = at });
                                     try out.append(p.a, l);
                                     break :blk l;
                                 },
                             };
-                            try out.append(p.a, try add(f, p.a, .{ .op = .{ .store = .{ .ptr = arg, .value = v } }, .ty = TypeTable.void_type }));
+                            try out.append(p.a, try p.add(f, .{ .op = .{ .store = .{ .ptr = arg, .value = v } }, .ty = TypeTable.void_type }));
                         }
                         // What the callee returns: its arguments or
                         // globals.
@@ -394,9 +398,9 @@ const Pass = struct {
                             for (vals, srcs, lts.items) |*v, src, lt| v.* = switch (src) {
                                 .param => |pi| args.items[pi],
                                 .global => |g| blk: {
-                                    const gp = try add(f, p.a, .{ .op = .{ .global = g }, .ty = lt, .ptr = .resource });
+                                    const gp = try p.add(f, .{ .op = .{ .global = g }, .ty = lt, .ptr = .resource });
                                     try out.append(p.a, gp);
-                                    const l = try add(f, p.a, .{ .op = .{ .load = gp }, .ty = lt });
+                                    const l = try p.add(f, .{ .op = .{ .load = gp }, .ty = lt });
                                     try out.append(p.a, l);
                                     break :blk l;
                                 },

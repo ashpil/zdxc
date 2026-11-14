@@ -373,8 +373,6 @@ pub const ResourceKind = enum(u8) {
 pub const Field = struct {
     name: []const u8,
     type: TypeId,
-    /// Matrices in the field are row_major (layout only).
-    row_major: bool = false,
     /// The field's semantic (`float4 pos : SV_Position;`).
     semantic: ?[]const u8 = null,
     /// Interpolation modifiers (for entry-point inputs and outputs).
@@ -503,16 +501,18 @@ pub const Type = union(enum) {
     @"error",
     scalar: Scalar,
     vector: struct { elem: Scalar, len: u16 },
-    matrix: struct { elem: Scalar, rows: u8, cols: u8 },
+    /// `orientation`: how the matrix is stored, part of a declaration's
+    /// type (written, by `#pragma pack_matrix` or by -Zpr). Matrices
+    /// computed from others have none. It is not what the matrix is (see
+    /// TypeTable.same).
+    matrix: struct { elem: Scalar, rows: u8, cols: u8, orientation: Orientation = .none },
     /// `len == 0` means unsized (`float a[]`).
     array: struct { elem: TypeId, len: u32 },
     @"struct": *StructInfo,
     @"enum": *EnumInfo,
     /// `elem` is the template argument (or the void type when absent).
     /// `flags`: RayQuery's constant ray flags (template arguments).
-    /// `row_major`: a structured buffer's matrix elements are (as written,
-    /// by `#pragma pack_matrix` or -Zpr; dxc's SPIR-V honors it).
-    resource: struct { kind: ResourceKind, elem: TypeId, name: []const u8, flags: u32 = 0, flags2: u32 = 0, row_major: bool = false },
+    resource: struct { kind: ResourceKind, elem: TypeId, name: []const u8, flags: u32 = 0, flags2: u32 = 0 },
     sampler: struct { comparison: bool },
     string,
     /// PointStream / LineStream / TriangleStream<T>.
@@ -635,12 +635,17 @@ pub const NodeKind = enum {
     }
 };
 
+/// A matrix's storage order (`row_major`: rows are contiguous).
+pub const Orientation = enum(u2) { none, row_major, column_major };
+
 pub const LinAlgMatrix = struct { comp: u32, m: u32, n: u32, use: u32, scope: u32 };
 
 /// Interns types. Ids 0 and 1 are `error` and `void`.
 pub const TypeTable = struct {
     gpa: Allocator,
     types: std.ArrayList(Type) = .empty,
+    /// Per type: its canonical type (see `canonical`).
+    canon: std.ArrayList(TypeId) = .empty,
     map: std.HashMapUnmanaged(Key, TypeId, KeyContext, std.hash_map.default_max_load_percentage) = .empty,
     /// scalar's results.
     scalars: [@typeInfo(Scalar).@"enum".field_names.len]TypeId = @splat(std.math.maxInt(TypeId)),
@@ -672,11 +677,13 @@ pub const TypeTable = struct {
         var t: TypeTable = .{ .gpa = gpa };
         try t.types.append(gpa, .@"error");
         try t.types.append(gpa, .void);
+        try t.canon.appendSlice(gpa, &.{ error_type, void_type });
         return t;
     }
 
     pub fn deinit(t: *TypeTable) void {
         t.types.deinit(t.gpa);
+        t.canon.deinit(t.gpa);
         t.map.deinit(t.gpa);
     }
 
@@ -689,11 +696,11 @@ pub const TypeTable = struct {
             .void, .@"error" => null,
             .scalar => |s| .{ .tag = 1, .a = @backingInt(s), .b = 0 },
             .vector => |v| .{ .tag = 2, .a = @backingInt(v.elem), .b = v.len },
-            .matrix => |m| .{ .tag = 3, .a = @backingInt(m.elem), .b = (@as(u64, m.rows) << 8) | m.cols },
+            .matrix => |m| .{ .tag = 3, .a = @backingInt(m.elem), .b = (@as(u64, @backingInt(m.orientation)) << 16) | (@as(u64, m.rows) << 8) | m.cols },
             .array => |a| .{ .tag = 4, .a = a.elem, .b = a.len },
             .@"struct" => |s| .{ .tag = 5, .a = @intFromPtr(s), .b = 0 },
             .@"enum" => |e| .{ .tag = 6, .a = @intFromPtr(e), .b = 0 },
-            .resource => |r| .{ .tag = 7, .a = (@as(u64, @intFromBool(r.row_major)) << 48) | (@as(u64, @backingInt(r.kind)) << 32) | r.elem, .b = std.hash.Wyhash.hash(r.flags | (@as(u64, r.flags2) << 32), r.name) },
+            .resource => |r| .{ .tag = 7, .a = (@as(u64, @backingInt(r.kind)) << 32) | r.elem, .b = std.hash.Wyhash.hash(r.flags | (@as(u64, r.flags2) << 32), r.name) },
             .sampler => |s| .{ .tag = 8, .a = @intFromBool(s.comparison), .b = 0 },
             .string => .{ .tag = 9, .a = 0, .b = 0 },
             .stream => |s| .{ .tag = 10, .a = @backingInt(s.kind), .b = s.elem },
@@ -707,13 +714,37 @@ pub const TypeTable = struct {
         };
     }
 
-    pub fn intern(t: *TypeTable, ty: Type) !TypeId {
+    pub fn intern(t: *TypeTable, ty: Type) Allocator.Error!TypeId {
         const key = keyOf(ty) orelse return if (ty == .void) void_type else error_type;
         const gop = try t.map.getOrPut(t.gpa, key);
         if (gop.found_existing) return gop.value_ptr.*;
+        const id: TypeId = @intCast(t.types.items.len);
+        gop.value_ptr.* = id;
         try t.types.append(t.gpa, ty);
-        gop.value_ptr.* = @intCast(t.types.items.len - 1);
-        return gop.value_ptr.*;
+        try t.canon.append(t.gpa, id);
+        // (Its parts are interned already, with their canonical types;
+        // interning the canonical type may add more.)
+        const c = try t.canonicalOf(id);
+        t.canon.items[id] = c;
+        return id;
+    }
+
+    /// The canonical type of new type `id` (its own id if canonical).
+    fn canonicalOf(t: *TypeTable, id: TypeId) Allocator.Error!TypeId {
+        return switch (t.get(id)) {
+            .matrix => |m| if (m.orientation == .none) id else t.intern(.{ .matrix = .{ .elem = m.elem, .rows = m.rows, .cols = m.cols } }),
+            .array => |a| if (t.canonical(a.elem) == a.elem) id else t.array(t.canonical(a.elem), a.len),
+            .patch => |p| if (t.canonical(p.elem) == p.elem) id else t.intern(.{ .patch = .{ .output = p.output, .elem = t.canonical(p.elem), .count = p.count } }),
+            .stream => |x| if (t.canonical(x.elem) == x.elem) id else t.intern(.{ .stream = .{ .kind = x.kind, .elem = t.canonical(x.elem) } }),
+            .resource => |r| if (t.canonical(r.elem) == r.elem) id else blk: {
+                var c = r;
+                c.elem = t.canonical(r.elem);
+                break :blk t.intern(.{ .resource = c });
+            },
+            .texture_view => |v| if (t.canonical(v.texture) == v.texture) id else t.intern(.{ .texture_view = .{ .texture = t.canonical(v.texture), .kind = v.kind } }),
+            .node => |x| if (t.canonical(x.elem) == x.elem) id else t.intern(.{ .node = .{ .kind = x.kind, .elem = t.canonical(x.elem) } }),
+            else => id,
+        };
     }
 
     pub fn scalar(t: *TypeTable, s: Scalar) !TypeId {
@@ -733,6 +764,69 @@ pub const TypeTable = struct {
 
     pub fn array(t: *TypeTable, elem: TypeId, len: u32) !TypeId {
         return t.intern(.{ .array = .{ .elem = elem, .len = len } });
+    }
+
+    /// `id` without the orientations of the matrices in it, wherever they
+    /// are (a buffer's elements included; a struct's fields are its own):
+    /// what the type is. How a matrix is stored is not what it is (clang's
+    /// attributed-type sugar: StructuredBuffer<row_major float4x4> is a
+    /// StructuredBuffer<float4x4>).
+    pub fn canonical(t: *const TypeTable, id: TypeId) TypeId {
+        return t.canon.items[id];
+    }
+
+    /// Whether `a` and `b` are the same type (see `canonical`).
+    pub fn same(t: *const TypeTable, a: TypeId, b: TypeId) bool {
+        return t.canonical(a) == t.canonical(b);
+    }
+
+    /// The orientation of the matrices `id` holds as values: itself, or
+    /// the elements of an array, patch or stream (a struct's fields have
+    /// their own); `none` for other types.
+    pub fn orientation(t: *const TypeTable, id: TypeId) Orientation {
+        return switch (t.get(id)) {
+            .matrix => |m| m.orientation,
+            .array => |a| t.orientation(a.elem),
+            .patch => |p| t.orientation(p.elem),
+            .stream => |x| t.orientation(x.elem),
+            else => .none,
+        };
+    }
+
+    /// Whether the matrices in `id` are stored row_major (column_major
+    /// when they have no orientation).
+    pub fn isRowMajor(t: *const TypeTable, id: TypeId) bool {
+        return t.orientation(id) == .row_major;
+    }
+
+    /// `id` with the matrices it holds as values (see `orientation`), and
+    /// those of the buffer it views (a resource's elements), oriented `o`:
+    /// all of them (`replace`), or those without an orientation
+    /// (`default`).
+    pub fn oriented(t: *TypeTable, id: TypeId, o: Orientation, mode: enum { replace, default }) !TypeId {
+        return switch (t.get(id)) {
+            .resource => |r| blk: {
+                const elem = try t.oriented(r.elem, o, mode);
+                if (elem == r.elem) break :blk id;
+                var c = r;
+                c.elem = elem;
+                break :blk t.intern(.{ .resource = c });
+            },
+            .matrix => |m| if (mode == .default and m.orientation != .none) id else t.intern(.{ .matrix = .{ .elem = m.elem, .rows = m.rows, .cols = m.cols, .orientation = o } }),
+            .array => |a| blk: {
+                const elem = try t.oriented(a.elem, o, mode);
+                break :blk if (elem == a.elem) id else t.array(elem, a.len);
+            },
+            .patch => |p| blk: {
+                const elem = try t.oriented(p.elem, o, mode);
+                break :blk if (elem == p.elem) id else t.intern(.{ .patch = .{ .output = p.output, .elem = elem, .count = p.count } });
+            },
+            .stream => |x| blk: {
+                const elem = try t.oriented(x.elem, o, mode);
+                break :blk if (elem == x.elem) id else t.intern(.{ .stream = .{ .kind = x.kind, .elem = elem } });
+            },
+            else => id,
+        };
     }
 
     /// Component type of a numeric (scalar / vector / matrix) type.
@@ -921,4 +1015,12 @@ test "interning and shapes" {
     const s = try t.format(std.testing.allocator, f4);
     defer std.testing.allocator.free(s);
     try std.testing.expectEqualStrings("vector<float, 4>", s);
+    // Orientation: a different type id, the same type.
+    const rm = try t.oriented(m, .row_major, .replace);
+    try std.testing.expect(rm != m and t.same(rm, m) and t.isRowMajor(rm));
+    try std.testing.expectEqual(m, t.canonical(rm));
+    const arr = try t.array(rm, 2);
+    try std.testing.expect(t.same(arr, try t.array(m, 2)) and t.isRowMajor(arr));
+    try std.testing.expectEqual(arr, try t.oriented(arr, .column_major, .default));
+    try std.testing.expect(!t.same(m, try t.matrix(.float, 4, 3)));
 }

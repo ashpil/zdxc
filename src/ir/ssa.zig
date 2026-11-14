@@ -209,17 +209,17 @@ fn dynamicComponents(m: *ir.Module, f: *ir.Function) Error!void {
                     const acc = f.inst(p).op.access;
                     const vec_ty = f.inst(acc.base).ty;
                     const len = t.get(vec_ty).vector.len;
-                    const w = try addInst(a, f, .{ .op = .{ .load = acc.base }, .ty = vec_ty });
+                    const w = try addInst(t, a, f, .{ .op = .{ .load = acc.base }, .ty = vec_ty });
                     try out.append(a, w);
-                    var v = try addInst(a, f, .{ .op = .{ .extract = .{ .agg = w, .index = len - 1 } }, .ty = inst.ty });
+                    var v = try addInst(t, a, f, .{ .op = .{ .extract = .{ .agg = w, .index = len - 1 } }, .ty = inst.ty });
                     try out.append(a, v);
                     var k: u32 = len - 1;
                     while (k > 0) {
                         k -= 1;
-                        const e = try addInst(a, f, .{ .op = .{ .extract = .{ .agg = w, .index = k } }, .ty = inst.ty });
-                        const c = try indexIs(a, f, acc.indices[0], k, bool_ty, &out);
+                        const e = try addInst(t, a, f, .{ .op = .{ .extract = .{ .agg = w, .index = k } }, .ty = inst.ty });
+                        const c = try indexIs(t, a, f, acc.indices[0], k, bool_ty, &out);
                         try out.append(a, e);
-                        v = try addInst(a, f, .{ .op = .{ .select = .{ .cond = c, .t = e, .f = v } }, .ty = inst.ty });
+                        v = try addInst(t, a, f, .{ .op = .{ .select = .{ .cond = c, .t = e, .f = v } }, .ty = inst.ty });
                         try out.append(a, v);
                     }
                     // The load becomes the selected value.
@@ -232,17 +232,17 @@ fn dynamicComponents(m: *ir.Module, f: *ir.Function) Error!void {
                     const vec_ty = f.inst(acc.base).ty;
                     const vt = t.get(vec_ty).vector;
                     const comp_ty = try t.scalar(vt.elem);
-                    const w = try addInst(a, f, .{ .op = .{ .load = acc.base }, .ty = vec_ty });
+                    const w = try addInst(t, a, f, .{ .op = .{ .load = acc.base }, .ty = vec_ty });
                     try out.append(a, w);
                     const comps = try a.alloc(Ref, vt.len);
                     for (comps, 0..) |*cp, k| {
-                        const e = try addInst(a, f, .{ .op = .{ .extract = .{ .agg = w, .index = @intCast(k) } }, .ty = comp_ty });
-                        const c = try indexIs(a, f, acc.indices[0], @intCast(k), bool_ty, &out);
+                        const e = try addInst(t, a, f, .{ .op = .{ .extract = .{ .agg = w, .index = @intCast(k) } }, .ty = comp_ty });
+                        const c = try indexIs(t, a, f, acc.indices[0], @intCast(k), bool_ty, &out);
                         try out.append(a, e);
-                        cp.* = try addInst(a, f, .{ .op = .{ .select = .{ .cond = c, .t = st.value, .f = e } }, .ty = comp_ty });
+                        cp.* = try addInst(t, a, f, .{ .op = .{ .select = .{ .cond = c, .t = st.value, .f = e } }, .ty = comp_ty });
                         try out.append(a, cp.*);
                     }
-                    const nv = try addInst(a, f, .{ .op = .{ .construct = comps }, .ty = vec_ty });
+                    const nv = try addInst(t, a, f, .{ .op = .{ .construct = comps }, .ty = vec_ty });
                     try out.append(a, nv);
                     f.insts.items[r.index()].op = .{ .store = .{ .ptr = acc.base, .value = nv } };
                 },
@@ -262,6 +262,7 @@ fn dynamicComponents(m: *ir.Module, f: *ir.Function) Error!void {
 /// stay one.
 fn outIntrinsics(m: *ir.Module, f: *ir.Function) Error!void {
     const a = m.arena;
+    const t = m.types;
     for (f.blocks.items) |*blk| {
         var out: std.ArrayList(Ref) = .empty;
         var any = false;
@@ -276,21 +277,21 @@ fn outIntrinsics(m: *ir.Module, f: *ir.Function) Error!void {
                 if (x.args.len != n_in + 2) continue;
                 const ptr = x.args[x.args.len - 1];
                 if (f.inst(ptr).ptr != .function) continue;
-                f.insts.items[r.index()] = .{ .op = .{ .intrinsic = .{ .name = x.name, .args = x.args[0 .. x.args.len - 1] } }, .ty = f.inst(ptr).ty };
-                try out.append(a, try addInst(a, f, .{ .op = .{ .store = .{ .ptr = ptr, .value = r } }, .ty = TypeTable.void_type }));
+                f.insts.items[r.index()] = .{ .op = .{ .intrinsic = .{ .name = x.name, .args = x.args[0 .. x.args.len - 1] } }, .ty = m.types.canonical(f.inst(ptr).ty) };
+                try out.append(a, try addInst(t, a, f, .{ .op = .{ .store = .{ .ptr = ptr, .value = r } }, .ty = TypeTable.void_type }));
                 any = true;
             } else if (std.mem.eql(u8, x.name, "sincos") and x.args.len == 3) {
                 const ty = f.inst(x.args[0]).ty;
                 const sp = x.args[1];
                 const cp = x.args[2];
                 if (f.inst(sp).ptr != .function or f.inst(cp).ptr != .function) continue;
-                if (f.inst(sp).ty != ty or f.inst(cp).ty != ty) continue;
+                if (m.types.canonical(f.inst(sp).ty) != ty or m.types.canonical(f.inst(cp).ty) != ty) continue;
                 const args = try a.dupe(Ref, x.args[0..1]);
                 f.insts.items[r.index()] = .{ .op = .{ .intrinsic = .{ .name = "sin", .args = args } }, .ty = ty };
-                const c = try addInst(a, f, .{ .op = .{ .intrinsic = .{ .name = "cos", .args = args } }, .ty = ty });
+                const c = try addInst(t, a, f, .{ .op = .{ .intrinsic = .{ .name = "cos", .args = args } }, .ty = ty });
                 try out.append(a, c);
-                try out.append(a, try addInst(a, f, .{ .op = .{ .store = .{ .ptr = sp, .value = r } }, .ty = TypeTable.void_type }));
-                try out.append(a, try addInst(a, f, .{ .op = .{ .store = .{ .ptr = cp, .value = c } }, .ty = TypeTable.void_type }));
+                try out.append(a, try addInst(t, a, f, .{ .op = .{ .store = .{ .ptr = sp, .value = r } }, .ty = TypeTable.void_type }));
+                try out.append(a, try addInst(t, a, f, .{ .op = .{ .store = .{ .ptr = cp, .value = c } }, .ty = TypeTable.void_type }));
                 any = true;
             }
         }
@@ -418,7 +419,7 @@ fn constantComponents(m: *ir.Module, f: *ir.Function) Error!void {
                 .load => |ptr| {
                     const rt = root[ptr.index()];
                     if (rt != .none and cand[rt.index()] and ptr != rt) {
-                        var v = try addInst(a, f, .{ .op = .{ .load = rt }, .ty = f.inst(rt).ty });
+                        var v = try addInst(t, a, f, .{ .op = .{ .load = rt }, .ty = f.inst(rt).ty });
                         try out.append(a, v);
                         var ty = f.inst(rt).ty;
                         const p = path[ptr.index()];
@@ -428,7 +429,7 @@ fn constantComponents(m: *ir.Module, f: *ir.Function) Error!void {
                                 // The load becomes the last extract.
                                 f.insts.items[r.index()].op = .{ .extract = .{ .agg = v, .index = k } };
                             } else {
-                                v = try addInst(a, f, .{ .op = .{ .extract = .{ .agg = v, .index = k } }, .ty = ty });
+                                v = try addInst(t, a, f, .{ .op = .{ .extract = .{ .agg = v, .index = k } }, .ty = ty });
                                 try out.append(a, v);
                             }
                         }
@@ -442,18 +443,18 @@ fn constantComponents(m: *ir.Module, f: *ir.Function) Error!void {
                         var aggs: [2]Ref = undefined;
                         var tys: [2]TypeId = undefined;
                         tys[0] = f.inst(rt).ty;
-                        aggs[0] = try addInst(a, f, .{ .op = .{ .load = rt }, .ty = tys[0] });
+                        aggs[0] = try addInst(t, a, f, .{ .op = .{ .load = rt }, .ty = tys[0] });
                         try out.append(a, aggs[0]);
                         for (1..p.len) |j| {
                             tys[j] = try stepTy(t, tys[j - 1]);
-                            aggs[j] = try addInst(a, f, .{ .op = .{ .extract = .{ .agg = aggs[j - 1], .index = p[j - 1] } }, .ty = tys[j] });
+                            aggs[j] = try addInst(t, a, f, .{ .op = .{ .extract = .{ .agg = aggs[j - 1], .index = p[j - 1] } }, .ty = tys[j] });
                             try out.append(a, aggs[j]);
                         }
                         var v = st.value;
                         var j = p.len;
                         while (j > 0) {
                             j -= 1;
-                            v = try addInst(a, f, .{ .op = .{ .insert = .{ .agg = aggs[j], .value = v, .index = p[j] } }, .ty = tys[j] });
+                            v = try addInst(t, a, f, .{ .op = .{ .insert = .{ .agg = aggs[j], .value = v, .index = p[j] } }, .ty = tys[j] });
                             try out.append(a, v);
                         }
                         f.insts.items[r.index()].op = .{ .store = .{ .ptr = rt, .value = v } };
@@ -468,9 +469,9 @@ fn constantComponents(m: *ir.Module, f: *ir.Function) Error!void {
 }
 
 /// `index == k` (as `index`'s type), appended to `out`.
-fn indexIs(a: Allocator, f: *ir.Function, index: Ref, k: u32, bool_ty: TypeId, out: *std.ArrayList(Ref)) Error!Ref {
-    const kc = try addInst(a, f, .{ .op = .{ .constant = .{ .int = k } }, .ty = f.inst(index).ty });
-    const c = try addInst(a, f, .{ .op = .{ .cmp = .{ .op = .eq, .lhs = index, .rhs = kc } }, .ty = bool_ty });
+fn indexIs(t: *const TypeTable, a: Allocator, f: *ir.Function, index: Ref, k: u32, bool_ty: TypeId, out: *std.ArrayList(Ref)) Error!Ref {
+    const kc = try addInst(t, a, f, .{ .op = .{ .constant = .{ .int = k } }, .ty = f.inst(index).ty });
+    const c = try addInst(t, a, f, .{ .op = .{ .cmp = .{ .op = .eq, .lhs = index, .rhs = kc } }, .ty = bool_ty });
     try out.appendSlice(a, &.{ kc, c });
     return c;
 }
@@ -478,8 +479,12 @@ fn indexIs(a: Allocator, f: *ir.Function, index: Ref, k: u32, bool_ty: TypeId, o
 // ----------------------------------------------------------------------
 // Uses
 
-fn addInst(a: Allocator, f: *ir.Function, inst: ir.Inst) Error!Ref {
-    try f.insts.append(a, inst);
+/// (A value's type is made canonical: the pieces of a local or of a value
+/// get their types from struct fields, as declared. See ir.Inst.ty.)
+fn addInst(t: *const TypeTable, a: Allocator, f: *ir.Function, inst: ir.Inst) Error!Ref {
+    var x = inst;
+    if (x.ptr == .none) x.ty = t.canonical(x.ty);
+    try f.insts.append(a, x);
     return @fromBackingInt(@intCast(f.insts.items.len - 1));
 }
 
@@ -705,7 +710,7 @@ fn splitLocals(m: *ir.Module, f: *ir.Function) Error!bool {
     defer for (0..n) |i| if (cand[i]) {
         // Split: the aggregate local is gone (the emitter declares every
         // local_var).
-        f.insts.items[i] = .{ .op = .undef, .ty = f.insts.items[i].ty };
+        f.insts.items[i] = .{ .op = .undef, .ty = t.canonical(f.insts.items[i].ty) };
     };
     // Rewrite loads and stores through the candidates and their chains.
     for (f.blocks.items) |*blk| {
@@ -906,8 +911,8 @@ fn splitShallow(m: *ir.Module, f: *ir.Function) Error!bool {
         const ty = f.insts.items[i].ty;
         switch (t.get(ty)) {
             // (No local for a member holding only resources.)
-            .@"struct" => |st| for (st.fields.items) |fld| try members.append(a, if (noData(t, fld.type)) .none else try addInst(a, f, .{ .op = .local_var, .ty = fld.type, .ptr = .function })),
-            .array => |x| for (0..x.len) |_| try members.append(a, try addInst(a, f, .{ .op = .local_var, .ty = x.elem, .ptr = .function })),
+            .@"struct" => |st| for (st.fields.items) |fld| try members.append(a, if (noData(t, fld.type)) .none else try addInst(t, a, f, .{ .op = .local_var, .ty = fld.type, .ptr = .function })),
+            .array => |x| for (0..x.len) |_| try members.append(a, try addInst(t, a, f, .{ .op = .local_var, .ty = x.elem, .ptr = .function })),
             else => unreachable,
         }
     }
@@ -951,14 +956,14 @@ fn splitShallow(m: *ir.Module, f: *ir.Function) Error!bool {
                     var parts: std.ArrayList(Ref) = .empty;
                     switch (t.get(inst.ty)) {
                         .@"struct" => |st| for (st.fields.items, 0..) |fld, k| {
-                            const v = try addInst(a, f, if (mems[k] == .none) .{ .op = .undef, .ty = fld.type } else .{ .op = .{ .load = mems[k] }, .ty = fld.type });
+                            const v = try addInst(t, a, f, if (mems[k] == .none) .{ .op = .undef, .ty = fld.type } else .{ .op = .{ .load = mems[k] }, .ty = fld.type });
                             // (The emitter leaves resource members out of
                             // a construct: no undef of a resource to emit.)
                             if (mems[k] != .none or !@import("layout.zig").isOpaque(t, fld.type)) try out.append(a, v);
                             try parts.append(a, v);
                         },
                         .array => |x| for (0..x.len) |k| {
-                            const v = try addInst(a, f, .{ .op = .{ .load = mems[k] }, .ty = x.elem });
+                            const v = try addInst(t, a, f, .{ .op = .{ .load = mems[k] }, .ty = x.elem });
                             try out.append(a, v);
                             try parts.append(a, v);
                         },
@@ -978,9 +983,9 @@ fn splitShallow(m: *ir.Module, f: *ir.Function) Error!bool {
                     for (0..count) |k| {
                         if (mems[k] == .none) continue;
                         const ety = stepType(t, ty, @intCast(k)).?;
-                        const x = try addInst(a, f, .{ .op = .{ .extract = .{ .agg = st.value, .index = @intCast(k) } }, .ty = ety });
+                        const x = try addInst(t, a, f, .{ .op = .{ .extract = .{ .agg = st.value, .index = @intCast(k) } }, .ty = ety });
                         try out.append(a, x);
-                        try out.append(a, try addInst(a, f, .{ .op = .{ .store = .{ .ptr = mems[k], .value = x } }, .ty = TypeTable.void_type }));
+                        try out.append(a, try addInst(t, a, f, .{ .op = .{ .store = .{ .ptr = mems[k], .value = x } }, .ty = TypeTable.void_type }));
                     }
                     continue;
                 },
@@ -1003,7 +1008,7 @@ fn splitShallow(m: *ir.Module, f: *ir.Function) Error!bool {
         f.insts.items[r.index()].op = try opt.mapOp(a, f.inst(r).op, Map{ .repl = repl });
     };
     for (0..n) |i| if (cand[i]) {
-        f.insts.items[i] = .{ .op = .undef, .ty = f.insts.items[i].ty };
+        f.insts.items[i] = .{ .op = .undef, .ty = t.canonical(f.insts.items[i].ty) };
     };
     return true;
 }
@@ -1034,7 +1039,7 @@ fn addLeaves(a: Allocator, f: *ir.Function, t: *TypeTable, ty: TypeId, out: *std
     switch (t.get(ty)) {
         .@"struct" => |st| for (st.fields.items) |fld| try addLeaves(a, f, t, fld.type, out),
         .array => |x| for (0..x.len) |_| try addLeaves(a, f, t, x.elem, out),
-        else => try out.append(a, try addInst(a, f, .{ .op = .local_var, .ty = ty, .ptr = .function })),
+        else => try out.append(a, try addInst(t, a, f, .{ .op = .local_var, .ty = ty, .ptr = .function })),
     }
 }
 
@@ -1060,7 +1065,7 @@ fn leafAt(t: *TypeTable, ty0: TypeId, path: []const u32) struct { ty: TypeId, of
 /// of a leaf, or a construct of its members' values.
 fn gather(a: Allocator, f: *ir.Function, t: *TypeTable, ty: TypeId, leaves: []const Ref, out: *std.ArrayList(Ref)) Error!Ref {
     if (!isAggregate(t, ty)) {
-        const v = try addInst(a, f, .{ .op = .{ .load = leaves[0] }, .ty = ty });
+        const v = try addInst(t, a, f, .{ .op = .{ .load = leaves[0] }, .ty = ty });
         try out.append(a, v);
         return v;
     }
@@ -1077,7 +1082,7 @@ fn gather(a: Allocator, f: *ir.Function, t: *TypeTable, ty: TypeId, leaves: []co
         },
         else => unreachable,
     }
-    const v = try addInst(a, f, .{ .op = .{ .construct = parts.items }, .ty = ty });
+    const v = try addInst(t, a, f, .{ .op = .{ .construct = parts.items }, .ty = ty });
     try out.append(a, v);
     return v;
 }
@@ -1085,19 +1090,19 @@ fn gather(a: Allocator, f: *ir.Function, t: *TypeTable, ty: TypeId, leaves: []co
 /// Stores value `v` of type `ty` into the leaf locals from `leaves[0]`.
 fn scatter(a: Allocator, f: *ir.Function, t: *TypeTable, ty: TypeId, leaves: []const Ref, v: Ref, out: *std.ArrayList(Ref)) Error!void {
     if (!isAggregate(t, ty)) {
-        try out.append(a, try addInst(a, f, .{ .op = .{ .store = .{ .ptr = leaves[0], .value = v } }, .ty = TypeTable.void_type }));
+        try out.append(a, try addInst(t, a, f, .{ .op = .{ .store = .{ .ptr = leaves[0], .value = v } }, .ty = TypeTable.void_type }));
         return;
     }
     var off: u32 = 0;
     switch (t.get(ty)) {
         .@"struct" => |st| for (st.fields.items, 0..) |fld, k| {
-            const x = try addInst(a, f, .{ .op = .{ .extract = .{ .agg = v, .index = @intCast(k) } }, .ty = fld.type });
+            const x = try addInst(t, a, f, .{ .op = .{ .extract = .{ .agg = v, .index = @intCast(k) } }, .ty = fld.type });
             try out.append(a, x);
             try scatter(a, f, t, fld.type, leaves[off..], x, out);
             off += leafCount(t, fld.type);
         },
         .array => |arr| for (0..arr.len) |k| {
-            const x = try addInst(a, f, .{ .op = .{ .extract = .{ .agg = v, .index = @intCast(k) } }, .ty = arr.elem });
+            const x = try addInst(t, a, f, .{ .op = .{ .extract = .{ .agg = v, .index = @intCast(k) } }, .ty = arr.elem });
             try out.append(a, x);
             try scatter(a, f, t, arr.elem, leaves[off..], x, out);
             off += leafCount(t, arr.elem);
@@ -1332,7 +1337,7 @@ fn promote(m: *ir.Module, f: *ir.Function) Error!void {
                     if (has_phi[d] == tag) continue;
                     has_phi[d] = tag;
                     const ty = f.inst(pvars.items[v]).ty;
-                    const r = try addInst(a, f, .{ .op = .{ .phi = &.{} }, .ty = ty });
+                    const r = try addInst(t, a, f, .{ .op = .{ .phi = &.{} }, .ty = ty });
                     try phis[d].append(a, .{ .v = @intCast(v), .r = r });
                     if (in_work[d] != tag) {
                         in_work[d] = tag;
@@ -1346,8 +1351,8 @@ fn promote(m: *ir.Module, f: *ir.Function) Error!void {
     const undefs = try a.alloc(Ref, nv);
     @memset(undefs, .none);
     const Undef = struct {
-        fn get(al: Allocator, fx: *ir.Function, us: []Ref, pv: []const Ref, v: u32) Error!Ref {
-            if (us[v] == .none) us[v] = try addInst(al, fx, .{ .op = .undef, .ty = fx.inst(pv[v]).ty });
+        fn get(tt: *const TypeTable, al: Allocator, fx: *ir.Function, us: []Ref, pv: []const Ref, v: u32) Error!Ref {
+            if (us[v] == .none) us[v] = try addInst(tt, al, fx, .{ .op = .undef, .ty = fx.inst(pv[v]).ty });
             return us[v];
         }
     };
@@ -1377,7 +1382,7 @@ fn promote(m: *ir.Module, f: *ir.Function) Error!void {
     var repl = Repl{ .to = try a.alloc(Ref, f.insts.items.len) };
     @memset(repl.to, .none);
     const cur = try a.alloc(Ref, nv);
-    for (cur, 0..) |*c, v| c.* = try Undef.get(a, f, undefs, pvars.items, @intCast(v));
+    for (cur, 0..) |*c, v| c.* = try Undef.get(t, a, f, undefs, pvars.items, @intCast(v));
     var log: std.ArrayList(struct { v: u32, old: Ref }) = .empty;
     var stack: std.ArrayList(struct { b: u32, mark: usize, enter: bool }) = .empty;
     try stack.append(a, .{ .b = 0, .mark = 0, .enter = true });
@@ -1421,13 +1426,13 @@ fn promote(m: *ir.Module, f: *ir.Function) Error!void {
         for (f.blocks.items[bi].insts.items) |r| switch (f.inst(r).op) {
             .load => |p| {
                 const v = var_of[p.index()];
-                if (v != none) repl.put(r.index(), try Undef.get(a, f, undefs, pvars.items, v));
+                if (v != none) repl.put(r.index(), try Undef.get(t, a, f, undefs, pvars.items, v));
             },
             else => {},
         };
         if (!emitted[bi]) continue;
         for (succs[bi]) |s| for (phis[s.index()].items) |p| {
-            try incoming[p.r.index()].append(a, .{ .value = try Undef.get(a, f, undefs, pvars.items, p.v), .block = @fromBackingInt(@intCast(bi)) });
+            try incoming[p.r.index()].append(a, .{ .value = try Undef.get(t, a, f, undefs, pvars.items, p.v), .block = @fromBackingInt(@intCast(bi)) });
         };
     }
     // Resolve: replacements may name other replaced loads; trivial phis
@@ -1508,7 +1513,7 @@ fn promote(m: *ir.Module, f: *ir.Function) Error!void {
         };
     }
     // The promoted locals are gone (the emitter declares every local_var).
-    for (pvars.items) |v| f.insts.items[v.index()] = .{ .op = .undef, .ty = f.inst(v).ty };
+    for (pvars.items) |v| f.insts.items[v.index()] = .{ .op = .undef, .ty = t.canonical(f.inst(v).ty) };
     try removeDeadPhis(a, f);
 }
 

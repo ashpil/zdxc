@@ -553,7 +553,9 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
         if (profile == null) return ctx.fail("missing -T <profile>", .{});
         if (module) |*m| {
             const zo = stats.begin(.ir_opt);
+            zdxc.ir.ir.verify(m);
             try zdxc.ir.opt.run(arena, m);
+            zdxc.ir.ir.verify(m);
             zo.end();
             const zv = stats.begin(.spirv);
             defer if (opts.spirv) zv.end();
@@ -572,6 +574,7 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
                     try zdxc.ir.inline_calls.run(m);
                     try zdxc.ir.ssa.run(m);
                 }
+                zdxc.ir.ir.verify(m);
             }
             if (opts.dump_ir) {
                 try zdxc.ir.ir.dump(m, ctx.stdout);
