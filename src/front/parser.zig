@@ -172,10 +172,10 @@ pub const Parser = struct {
         // At end of input, point just past the last real token (as clang).
         if (t.kind == .eof and index > 0) {
             const prev = p.toks[index - 1];
-            const loc = if (prev.loc.isMacro()) prev.loc else prev.loc.advance(@intCast(prev.text.len));
+            const loc = if (prev.loc.isMacro()) prev.loc else prev.loc.advance(prev.sourceLen());
             return p.diags.report(.{ .severity = sev, .loc = loc }, fmt, args);
         }
-        const len: u32 = if (t.kind == .eof) 0 else @intCast(t.text.len);
+        const len: u32 = if (t.kind == .eof) 0 else t.sourceLen();
         return p.diags.report(.{ .severity = sev, .loc = t.loc, .len = len }, fmt, args);
     }
 
@@ -184,7 +184,7 @@ pub const Parser = struct {
         if (p.pos == 0) return p.tok().loc;
         const prev = p.toks[p.pos - 1];
         if (prev.loc.isMacro()) return prev.loc;
-        return prev.loc.advance(@intCast(prev.text.len));
+        return prev.loc.advance(prev.sourceLen());
     }
 
     fn expect(p: *Parser, kind: Kind, what: []const u8) Error!Token {
@@ -615,7 +615,7 @@ pub const Parser = struct {
         const name = try p.parseName();
         if (!(if (name.parts.len > 1) p.isMemberTypeName(name.last()) else p.isTypeName(name.last()))) {
             p.diags.position = p.pos;
-            _ = p.diags.report(.{ .severity = .@"error", .loc = start.loc, .len = @intCast(start.text.len) }, "unknown type name '{s}'", .{name.last()});
+            _ = p.diags.report(.{ .severity = .@"error", .loc = start.loc, .len = start.sourceLen() }, "unknown type name '{s}'", .{name.last()});
             return error.Syntax;
         }
         var args: []const ast.TemplateArg = &.{};
@@ -2462,6 +2462,26 @@ test "diagnostics: include chain, macro backtrace, ordering, fix-its" {
         \\t.hlsl:6:10: fatal error: 'missing.h' file not found
         \\#include "missing.h"
         \\         ^~~~~~~~~~~
+        \\
+    , out.written());
+}
+
+test "diagnostics after an identifier with universal character names" {
+    const gpa = testing.allocator;
+    var t: TestParse = .{};
+    defer t.deinit();
+    _ = try t.run("int \\u03b1\\u03b2\\u03b3\nint y;\n\\u03b1\\u03b2\\u03b3\\u03b4 z;\n");
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try t.diags.render(&t.sm, &out.writer, .{});
+    try testing.expectEqualStrings(
+        \\t.hlsl:1:23: error: expected ';' at end of declaration
+        \\int \u03b1\u03b2\u03b3
+        \\                      ^
+        \\                      ;
+        \\t.hlsl:3:1: error: unknown type name 'αβγδ'
+        \\\u03b1\u03b2\u03b3\u03b4 z;
+        \\^~~~~~~~~~~~~~~~~~~~~~~~
         \\
     , out.written());
 }

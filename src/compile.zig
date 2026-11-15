@@ -474,6 +474,7 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
             .spirv_minor = if (zdxc.spirv.emit.TargetEnv.parse(opts.target_env)) |t| t.minor else 0,
             .enable_16bit = opts.enable_16bit,
             .hlsl_version = opts.hlsl_version,
+            .preprocess_only = opts.preprocess,
         });
         var out: Io.Writer.Allocating = .init(arena);
         var module: ?zdxc.ir.ir.Module = null;
