@@ -8,6 +8,7 @@ const BumpArena = @import("../BumpArena.zig");
 const Allocator = std.mem.Allocator;
 const source = @import("source.zig");
 const lexer = @import("lexer.zig");
+const unicode = @import("unicode.zig");
 const Diagnostics = @import("../diag.zig").Diagnostics;
 const Report = @import("../diag.zig").Report;
 const Token = lexer.Token;
@@ -32,6 +33,9 @@ pub const Options = struct {
     spirv_minor: u32 = 0,
     enable_16bit: bool = false,
     hlsl_version: u16 = 2021,
+    /// Preprocessing only (-P): stray Unicode is passed through rather than
+    /// diagnosed, as by dxc.
+    preprocess_only: bool = false,
 };
 
 const Builtin = enum {
@@ -191,8 +195,12 @@ pub const Preprocessor = struct {
     fn enterFileFrom(pp: *Preprocessor, id: source.FileId, included_from: Loc) !void {
         pp.sm.setIncludedFrom(id, included_from);
         const f = pp.sm.file(id);
+        var lex: lexer.Lexer = .init(f.text, id);
+        const sink = try pp.arena.create(lexer.Lexer.Sink);
+        sink.* = .{ .diags = pp.diags, .arena = pp.arena, .passthrough = pp.opts.preprocess_only };
+        lex.sink = sink;
         try pp.includes.append(pp.arena, .{
-            .lex = .init(f.text, id),
+            .lex = lex,
             // The predefines pseudo-file has no directory to search.
             .dir = if (std.mem.eql(u8, f.path, "<built-in>")) "" else std.fs.path.dirname(f.path) orelse ".",
             .cond_base = pp.conds.items.len,
@@ -615,9 +623,15 @@ pub const Preprocessor = struct {
         const t = l.next();
         var result: Token = .{ .kind = t.kind, .flags = lhs.flags, .text = text, .loc = lhs.loc };
         result.flags.no_expand = false;
+        result.flags.ucn = false; // its spelling is not lhs's
+
         if (t.text.len != text.len) {
             pp.diags.err(lhs.loc, "pasting formed '{s}', an invalid preprocessing token", .{text});
             result.kind = .invalid;
+        } else if (t.kind == .identifier and std.mem.indexOfScalar(u8, text, '\\') != null) {
+            // A pasted universal character name: spelled in UTF-8 like a
+            // lexed one, so `\ ## u03b1` names the macro `α`.
+            result.text = try unicode.ucnsToUtf8(pp.arena, text);
         }
         return result;
     }
@@ -632,6 +646,11 @@ pub const Preprocessor = struct {
                     if (c == '"' or c == '\\') try buf.append(pp.arena, '\\');
                     try buf.append(pp.arena, c);
                 }
+            } else if (t.flags.ucn) {
+                // As written (`α`, not `α`), at the spelling location:
+                // an argument's token may carry an expansion location.
+                const sp = pp.sm.spellingLoc(t.loc);
+                try buf.appendSlice(pp.arena, lexer.Lexer.spellingAt(pp.sm.file(sp.file).text, sp.offset));
             } else try buf.appendSlice(pp.arena, t.text);
         }
         try buf.append(pp.arena, '"');
@@ -708,7 +727,12 @@ pub const Preprocessor = struct {
     /// Handle a directive whose `#` has been read. Returns a token for
     /// `#pragma` lines that are passed through.
     fn handleDirective(pp: *Preprocessor, hash: Token) Error!?Token {
+        // The directive's file stays at this depth (an #include pushes the
+        // included file above it, which may move the frames).
+        const depth = pp.includes.items.len;
+        defer pp.includes.items[depth - 1].lex.endDirective();
         const lx = pp.currentLexer().?;
+        lx.beginDirective();
         const saved = lx.*;
         const name = lx.next();
         if (name.kind == .eof or name.flags.bol) {
@@ -793,6 +817,12 @@ pub const Preprocessor = struct {
     /// #else (when nothing was taken), or the matching #endif.
     fn skipGroup(pp: *Preprocessor) Error!void {
         const lx = pp.currentLexer().?;
+        // Skipped text is not diagnosed.
+        const sink = lx.sink;
+        if (sink) |s| s.quiet = true;
+        defer if (sink) |s| {
+            s.quiet = false;
+        };
         var depth: u32 = 0;
         while (true) {
             const t = lx.next();
@@ -847,7 +877,13 @@ pub const Preprocessor = struct {
                     lx.skipLine();
                     continue;
                 }
-                if (try pp.evalCondition(d)) {
+                // (The condition is lexed as live text.)
+                if (sink) |s| s.quiet = false;
+                lx.beginDirective();
+                const taken = try pp.evalCondition(d);
+                lx.endDirective();
+                if (sink) |s| s.quiet = true;
+                if (taken) {
                     c.taken = true;
                     return;
                 }
@@ -1647,4 +1683,41 @@ test "deep nesting is diagnosed instead of overflowing the stack" {
     defer t.deinit();
     _ = try t.output();
     try std.testing.expectEqual(@as(u32, 2), t.diags.error_count);
+}
+
+fn expectUnicode(main: []const u8, expected: []const u8, messages: []const []const u8) !void {
+    var t: TestPP = .{};
+    try t.init(&.{}, main, .{});
+    defer t.deinit();
+    try std.testing.expectEqualStrings(expected, try t.output());
+    try std.testing.expectEqual(messages.len, t.diags.list.items.len);
+    for (messages, t.diags.list.items) |m, d| try std.testing.expectEqualStrings(m, d.message);
+}
+
+test "Unicode identifiers and stray Unicode" {
+    const non_ascii = "non-ASCII characters are not allowed outside of literals and identifiers";
+    const space = "treating Unicode character as whitespace";
+    // Universal character names are spelled as UTF-8, in macro names too.
+    try expectUnicode("#define \\u03a9 2\nx\\u03b1 \\U000003B1 \u{3A9}", "xα α 2", &.{});
+    try expectUnicode("#define C(a, b) a##b\nC(x, α)", "xα", &.{});
+    // Pasting one spells it in UTF-8 too; `#` keeps it as written.
+    try expectUnicode("#define C(a, b) a##b\n#define \\u03b1 1\nC(\\, u03b1)", "1", &.{});
+    try expectUnicode("#define S(a) #a\nS(x\\u03b1 \u{3B2})", "\"x\\u03b1 \u{3B2}\"", &.{});
+    // Outside directives, characters that cannot start a token are dropped.
+    try expectUnicode("x\u{1F600}y \u{301}z", "x y z", &.{ non_ascii, non_ascii });
+    try expectUnicode("a\xffb", "a b", &.{"source file is not valid UTF-8"});
+    // Unicode whitespace separates tokens; each is diagnosed once, though
+    // the directive is lexed more than once.
+    try expectUnicode("a\u{3000}b\\u3000c", "a b c", &.{ space, space });
+    try expectUnicode("#define A 1\u{3000}\nA", "1", &.{space});
+    // In a directive the character stays a token.
+    try expectUnicode("#define A 1\u{1F600}\nA", "1 \u{1F600}", &.{});
+    // Skipped groups are not diagnosed, nor is what follows a directive
+    // diagnosed while the preprocessor looks ahead.
+    try expectUnicode("#if 0\n\u{1F600}\u{3000}\n#endif\nx", "x", &.{});
+    try expectUnicode("#if 0\n#elif 1\u{3000}\n\u{1F600}y\n#endif", "y", &.{ space, non_ascii });
+    // Universal character names that are not.
+    try expectUnicode("x\\u03b", "x \\ u03b", &.{"incomplete universal character name; treating as '\\' followed by identifier"});
+    try expectUnicode("x\\u0041", "x \\ u0041", &.{"character 'A' cannot be specified by a universal character name"});
+    try expectUnicode("\\ud800", "\\ ud800", &.{"universal character name refers to a surrogate character"});
 }

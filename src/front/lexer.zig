@@ -4,6 +4,9 @@
 const std = @import("std");
 const source = @import("source.zig");
 const scan = @import("scan.zig");
+const unicode = @import("unicode.zig");
+const diag = @import("../diag.zig");
+const Diagnostics = diag.Diagnostics;
 
 pub const Kind = enum(u8) {
     eof,
@@ -82,7 +85,10 @@ pub const Flags = packed struct(u8) {
     no_expand: bool = false,
     /// Transient, during macro substitution: the token came from an argument.
     from_arg: bool = false,
-    _: u4 = 0,
+    /// An identifier whose universal character names `text` spells in
+    /// UTF-8; the source spelling (for `#`) is at `loc`.
+    ucn: bool = false,
+    _: u3 = 0,
 };
 
 pub const Token = struct {
@@ -108,9 +114,71 @@ pub const Lexer = struct {
     file: source.FileId,
     pos: u32 = 0,
     at_bol: bool = true,
+    /// Diagnostics for stray Unicode, and storage for normalized
+    /// identifiers; null lexes raw.
+    sink: ?*Sink = null,
+    /// On a directive's line, between the preprocessor's `beginDirective`
+    /// and `endDirective`.
+    in_directive: bool = false,
+    /// The token being lexed needs a second look: it has a universal
+    /// character name, or a backslash that is not one. (False at the start
+    /// of every token.)
+    unusual: bool = false,
+
+    /// What a file the preprocessor reads reports to. Unicode whitespace is
+    /// skipped with a warning, and outside directives a character that
+    /// cannot start a token is dropped with an error, as dxc does (raw
+    /// lexing keeps either as an `.invalid` token). It is shared by the
+    /// lexer's copies, so text that is lexed again after the preprocessor
+    /// looks ahead is diagnosed once.
+    pub const Sink = struct {
+        diags: *Diagnostics,
+        /// Owns the UTF-8 spelling of identifiers written with universal
+        /// character names (`\u03b1`).
+        arena: std.mem.Allocator,
+        /// In a skipped group: nothing is diagnosed.
+        quiet: bool = false,
+        /// Preprocessed output (-P): stray Unicode is kept as tokens, and
+        /// nothing is diagnosed; identifiers are still normalized.
+        passthrough: bool = false,
+        /// Offsets before this have been diagnosed. A single high-water mark
+        /// suffices because the lexer only goes back by restoring a saved
+        /// copy, which lexes the same text again.
+        diagnosed_to: u32 = 0,
+    };
 
     pub fn init(text: []const u8, file: source.FileId) Lexer {
         return .{ .text = text, .file = file };
+    }
+
+    /// Stray Unicode is kept as tokens.
+    fn raw(l: *const Lexer) bool {
+        const sink = l.sink orelse return true;
+        return sink.passthrough;
+    }
+
+    /// The preprocessor has read the `#` starting a directive.
+    pub fn beginDirective(l: *Lexer) void {
+        l.in_directive = true;
+    }
+
+    /// The preprocessor is done with the directive on this line.
+    pub fn endDirective(l: *Lexer) void {
+        l.in_directive = false;
+    }
+
+    /// Where to report a diagnostic at the current position, if anywhere.
+    /// `peeking`: past the end of a directive, where the preprocessor
+    /// only looks ahead.
+    fn reportTo(l: *const Lexer, peeking: bool) ?*Sink {
+        const sink = l.sink orelse return null;
+        if (sink.quiet or sink.passthrough or peeking or l.pos < sink.diagnosed_to) return null;
+        return sink;
+    }
+
+    fn report(l: *Lexer, sink: *Sink, severity: diag.Severity, len: u32, group: ?[]const u8, comptime fmt: []const u8, args: anytype) void {
+        _ = sink.diags.report(.{ .severity = severity, .loc = .{ .file = l.file, .offset = l.pos }, .len = len, .group = group }, fmt, args);
+        sink.diagnosed_to = l.pos + len;
     }
 
     fn peekAt(l: *const Lexer, i: usize) u8 {
@@ -119,9 +187,12 @@ pub const Lexer = struct {
 
     /// Skip whitespace and comments; report whether any was seen and whether
     /// a newline was crossed.
-    fn skipTrivia(l: *Lexer) struct { space: bool, newline: bool } {
+    fn skipTrivia(l: *Lexer) struct { space: bool, newline: bool, peeking: bool } {
         var space = false;
         var newline = false;
+        // Past a newline before the preprocessor has ended the directive,
+        // it is looking ahead.
+        var peeking = false;
         while (l.pos < l.text.len) {
             const c = l.text[l.pos];
             switch (c) {
@@ -132,7 +203,13 @@ pub const Lexer = struct {
                 '\n' => {
                     newline = true;
                     space = false;
+                    if (l.in_directive) peeking = true;
                     l.pos += 1;
+                },
+                0x80...0xff, '\\' => switch (l.unicodeTrivia(peeking)) {
+                    .space => space = true,
+                    .dropped => {},
+                    .token => break,
                 },
                 '/' => {
                     const n = l.peekAt(l.pos + 1);
@@ -151,7 +228,7 @@ pub const Lexer = struct {
                 else => break,
             }
         }
-        return .{ .space = space, .newline = newline };
+        return .{ .space = space, .newline = newline, .peeking = peeking };
     }
 
     pub fn next(l: *Lexer) Token {
@@ -162,12 +239,119 @@ pub const Lexer = struct {
         l.at_bol = false;
         const start = l.pos;
         const kind = l.lexToken();
+        var text = l.text[start..l.pos];
+        if (l.unusual) if (l.unusualToken(kind, text, start, trivia.peeking)) |utf8| {
+            text = utf8;
+            flags.ucn = true;
+        };
         return .{
             .kind = kind,
             .flags = flags,
-            .text = l.text[start..l.pos],
+            .text = text,
             .loc = .{ .file = l.file, .offset = start },
         };
+    }
+
+    /// The UTF-8 spelling of an identifier with universal character names,
+    /// or null to keep the source spelling; an invalid token is diagnosed
+    /// if it is a bad universal character name.
+    noinline fn unusualToken(l: *Lexer, kind: Kind, text: []const u8, start: u32, peeking: bool) ?[]const u8 {
+        @branchHint(.cold);
+        defer l.unusual = false;
+        const sink = l.sink orelse return null;
+        // (Out of memory keeps the spelling; the arena's owner fails on its
+        // next allocation.)
+        if (kind == .identifier) return unicode.ucnsToUtf8(sink.arena, text) catch null;
+        if (kind == .invalid and text[0] == '\\') l.diagnoseUcn(start, peeking);
+        return null;
+    }
+
+    /// At a non-ASCII byte or backslash in trivia: Unicode whitespace, a
+    /// dropped character, or the start of a token.
+    noinline fn unicodeTrivia(l: *Lexer, peeking: bool) enum { space, dropped, token } {
+        @branchHint(.cold);
+        if (l.text[l.pos] == '\\') return if (l.skipUcnWhitespace(peeking)) .space else .token;
+        if (l.skipUnicode(peeking)) return .space;
+        return if (l.dropNonAscii(peeking)) .dropped else .token;
+    }
+
+    /// At a non-ASCII byte in trivia: skip Unicode whitespace (with a
+    /// warning), unless lexing raw.
+    fn skipUnicode(l: *Lexer, peeking: bool) bool {
+        if (l.raw()) return false;
+        const d = unicode.decodeUtf8(l.text, l.pos) orelse return false;
+        if (!unicode.isWhitespace(d.cp)) return false;
+        l.skipWhitespace(d.len, peeking);
+        return true;
+    }
+
+    /// At a backslash in trivia: skip a universal character name for
+    /// Unicode whitespace (with a warning), unless lexing raw.
+    fn skipUcnWhitespace(l: *Lexer, peeking: bool) bool {
+        if (l.raw()) return false;
+        const u = unicode.decodeUcn(l.text, l.pos) orelse return false;
+        if (!unicode.isWhitespace(u.cp)) return false;
+        l.skipWhitespace(u.len, peeking);
+        return true;
+    }
+
+    fn skipWhitespace(l: *Lexer, len: u32, peeking: bool) void {
+        if (l.reportTo(peeking)) |sink| l.report(sink, .warning, len, "unicode-whitespace", "treating Unicode character as whitespace", .{});
+        l.pos += len;
+    }
+
+    /// At a non-ASCII byte that is not whitespace, outside directives and
+    /// unless lexing raw: drop it with an error unless it starts an
+    /// identifier (dxc drops it rather than letting the parser trip over
+    /// it). Malformed UTF-8 drops a byte.
+    fn dropNonAscii(l: *Lexer, peeking: bool) bool {
+        if (l.raw() or l.in_directive) return false;
+        const decoded = unicode.decodeUtf8(l.text, l.pos);
+        if (decoded) |d| if (unicode.isIdentCodepoint(d.cp)) return false;
+        const len: u32, const msg = if (decoded) |d|
+            .{ d.len, "non-ASCII characters are not allowed outside of literals and identifiers" }
+        else
+            .{ 1, "source file is not valid UTF-8" };
+        if (l.reportTo(peeking)) |sink| l.report(sink, .@"error", len, null, "{s}", .{msg});
+        l.pos += len;
+        return true;
+    }
+
+    /// At a backslash lexed as an invalid token: dxc's diagnostics for a
+    /// universal character name that is not one.
+    fn diagnoseUcn(l: *Lexer, at: u32, peeking: bool) void {
+        const save = l.pos;
+        defer l.pos = save;
+        l.pos = at;
+        const sink = l.reportTo(peeking) orelse return;
+        const digits: u32 = switch (l.peekAt(at + 1)) {
+            'u' => 4,
+            'U' => 8,
+            else => return,
+        };
+        var v: u32 = 0;
+        var n: u32 = 0;
+        while (n < digits) : (n += 1) {
+            const h = std.fmt.charToDigit(l.peekAt(at + 2 + n), 16) catch break;
+            v = v * 16 + h;
+        }
+        if (n < digits) {
+            l.report(sink, .warning, 1, "unicode", "incomplete universal character name; treating as '\\' followed by identifier", .{});
+        } else if (v >= 0xD800 and v <= 0xDFFF) {
+            l.report(sink, .warning, 2 + digits, "unicode", "universal character name refers to a surrogate character", .{});
+        } else if (v < 0x20 or (v >= 0x7F and v < 0xA0)) {
+            l.report(sink, .@"error", 2 + digits, null, "universal character name refers to a control character", .{});
+        } else if (v < 0x7F and v != '$' and v != '@' and v != '`') {
+            l.report(sink, .@"error", 2 + digits, null, "character '{c}' cannot be specified by a universal character name", .{@as(u8, @intCast(v))});
+        }
+    }
+
+    /// The source spelling of the token at `offset`, universal character
+    /// names as written.
+    pub fn spellingAt(text: []const u8, offset: u32) []const u8 {
+        var l: Lexer = .init(text, 0);
+        l.pos = offset;
+        return l.next().text;
     }
 
     /// Rest of the current line, used for `#error`, `#pragma` and similar.
@@ -232,9 +416,10 @@ pub const Lexer = struct {
         l.pos += 1;
         switch (c) {
             'a'...'z', 'A'...'Z', '_' => {
-                l.pos = @intCast(scan.skipIdent(l.text, l.pos));
+                l.lexIdentRest();
                 return .identifier;
             },
+            0x80...0xff, '\\' => return l.lexUnicodeStart(c),
             '0'...'9' => {
                 l.lexPpNumber();
                 return .number;
@@ -286,6 +471,57 @@ pub const Lexer = struct {
         }
     }
 
+    /// After a non-ASCII byte or a backslash that starts a token: an
+    /// identifier, or an invalid token.
+    noinline fn lexUnicodeStart(l: *Lexer, c: u8) Kind {
+        @branchHint(.cold);
+        const start = l.pos - 1;
+        const ucn = c == '\\';
+        if (ucn) l.unusual = true;
+        const d = (if (ucn) unicode.decodeUcn(l.text, start) else unicode.decodeUtf8(l.text, start)) orelse return .invalid;
+        // A character that cannot start an identifier is a token by itself;
+        // a backslash before such a universal character name is one alone.
+        const ident = unicode.isIdentCodepoint(d.cp);
+        if (ident or !ucn) l.pos = @intCast(start + d.len);
+        if (!ident) return .invalid;
+        l.lexIdentRest();
+        return .identifier;
+    }
+
+    /// The rest of an identifier: ASCII identifier characters, and the
+    /// Unicode ones spelled in UTF-8 or as universal character names.
+    fn lexIdentRest(l: *Lexer) void {
+        while (true) {
+            l.pos = @intCast(scan.skipIdent(l.text, l.pos));
+            if (!l.eatUnicodeIdentChar()) return;
+        }
+    }
+
+    /// Consume one non-ASCII identifier character, if one is next.
+    inline fn eatUnicodeIdentChar(l: *Lexer) bool {
+        const c = l.peekAt(l.pos);
+        if (!maybe_unicode[c]) return false;
+        return l.eatUnicodeIdentCharSlow(c);
+    }
+
+    noinline fn eatUnicodeIdentCharSlow(l: *Lexer, c: u8) bool {
+        @branchHint(.cold);
+        if (c >= 0x80) {
+            const d = unicode.decodeUtf8(l.text, l.pos) orelse return false;
+            if (!unicode.isIdentCodepoint(d.cp)) return false;
+            l.pos += d.len;
+            return true;
+        }
+        if (c == '\\') {
+            const u = unicode.decodeUcn(l.text, l.pos) orelse return false;
+            if (!unicode.isIdentCodepoint(u.cp)) return false;
+            l.pos += u.len;
+            l.unusual = true;
+            return true;
+        }
+        return false;
+    }
+
     fn eat(l: *Lexer, c: u8) bool {
         if (l.peekAt(l.pos) == c) {
             l.pos += 1;
@@ -310,6 +546,7 @@ pub const Lexer = struct {
                 l.pos += 1;
                 continue;
             }
+            if (l.eatUnicodeIdentChar()) continue;
             break;
         }
     }
@@ -359,6 +596,15 @@ pub fn charValue(text: []const u8) ?i64 {
     };
 }
 
+/// Bytes that may start a non-ASCII identifier character: UTF-8 lead and
+/// continuation bytes, and the backslash of a universal character name.
+const maybe_unicode: [256]bool = blk: {
+    var t: [256]bool = @splat(false);
+    for (0x80..0x100) |c| t[c] = true;
+    t['\\'] = true;
+    break :blk t;
+};
+
 pub fn isIdentChar(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_';
 }
@@ -393,4 +639,17 @@ test "comments, flags and lines" {
     const c = l.next();
     try std.testing.expect(c.flags.bol);
     try std.testing.expectEqualStrings("c", c.text);
+}
+
+test "Unicode identifiers" {
+    // UTF-8 and universal character names, starting or continuing one.
+    try expectKinds("αβ+速度 x\\u03b1y \\U000003B1", &.{ .identifier, .plus, .identifier, .identifier, .identifier });
+    try expectKinds("1α", &.{.number});
+    // Raw lexing keeps what cannot be in an identifier as tokens.
+    try expectKinds("x\u{1F600} x\u{301} ×", &.{ .identifier, .invalid, .identifier, .invalid, .invalid });
+    try expectKinds("x\xff", &.{ .identifier, .invalid });
+    try expectKinds("x\\u0301 \\u03b", &.{ .identifier, .invalid, .identifier, .invalid, .identifier });
+    var l = Lexer.init("x\u{1F600}", 0);
+    try std.testing.expectEqualStrings("x", l.next().text);
+    try std.testing.expectEqualStrings("\u{1F600}", l.next().text);
 }
