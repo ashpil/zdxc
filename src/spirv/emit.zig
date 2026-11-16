@@ -14,6 +14,7 @@ const memory_model = @import("memory_model.zig");
 const builder = @import("builder.zig");
 const diag = @import("../diag.zig");
 const layout = @import("../ir/layout.zig");
+const source = @import("../front/source.zig");
 
 const Builder = builder.Builder;
 const Id = builder.Id;
@@ -142,10 +143,60 @@ pub const TargetEnv = struct {
     }
 };
 
+/// -fspv-debug: what to write about the source.
+pub const Debug = struct {
+    sm: *const source.SourceManager,
+    main_file: source.FileId,
+    /// OpString and OpSource per file.
+    file: bool = false,
+    /// The files' text in their OpSource.
+    text: bool = false,
+    /// OpLine in function bodies (the module has positions) and the
+    /// names of local variables.
+    line: bool = false,
+    /// OpModuleProcessed with each of these.
+    processed: []const []const u8 = &.{},
+    /// NonSemantic.Shader.DebugInfo.100 (with `line`): scopes, types and
+    /// variables, and DebugLine in place of OpLine.
+    rich: bool = false,
+    /// The compiler and its arguments, for DebugEntryPoint.
+    signature: []const u8 = "",
+    args: []const u8 = "",
+};
+
+/// NonSemantic.Shader.DebugInfo.100: what has been written.
+const Rich = struct {
+    set: Id,
+    /// DebugInfoNone, the compilation unit, the empty expression and the
+    /// main file's DebugSource.
+    none: Id = 0,
+    cu: Id = 0,
+    expr: Id = 0,
+    main: Id = 0,
+    /// DebugSource by the OpString of the file's name.
+    sources: std.AutoHashMapUnmanaged(Id, Id) = .empty,
+    types: std.AutoHashMapUnmanaged(TypeId, Id) = .empty,
+    /// Per function: its DebugFunction (0: not made) and its own scope.
+    funcs: []Id,
+    func_scopes: []ir.ScopeId,
+    /// Per `Module.scopes` and `Module.inline_sites` (0: not made).
+    scopes: []Id,
+    inlined: []Id,
+    /// Per variable of the function being emitted: its
+    /// DebugLocalVariable (0: not made).
+    vars: []Id = &.{},
+};
+
+const DebugPos = struct { src: Id, line: u32, col: u32 };
+
 pub fn emit(gpa: Allocator, m: *const ir.Module, diags: *diag.Diagnostics, env: TargetEnv) Error![]u8 {
+    return emitDebug(gpa, m, diags, env, null);
+}
+
+pub fn emitDebug(gpa: Allocator, m: *const ir.Module, diags: *diag.Diagnostics, env: TargetEnv, dbg: ?Debug) Error![]u8 {
     var arena_state = BumpArena.init(gpa);
     defer arena_state.deinit();
-    var e: Emitter = .{ .arena = arena_state.allocator(), .b = .init(gpa), .m = m, .t = m.types, .diags = diags, .spv_minor = env.minor, .universal = env.universal, .vk = m.vk };
+    var e: Emitter = .{ .arena = arena_state.allocator(), .b = .init(gpa), .m = m, .t = m.types, .diags = diags, .spv_minor = env.minor, .universal = env.universal, .vk = m.vk, .dbg = dbg };
     defer e.b.deinit();
     try e.module();
     try @import("dce.zig").run(e.arena, &e.b);
@@ -214,6 +265,11 @@ const Emitter = struct {
     spec_ids: std.AutoHashMapUnmanaged(u32, Id) = .empty,
     ext_imports: std.StringHashMapUnmanaged(Id) = .empty,
     string_ids: std.StringHashMapUnmanaged(Id) = .empty,
+    dbg: ?Debug = null,
+    rich: ?Rich = null,
+    /// The last file name an OpLine used, and its OpString.
+    line_file: []const u8 = "",
+    line_file_id: Id = 0,
     /// Reads of resource locals nothing assigns: the resource of the same
     /// type each stands in with where it is used.
     undef_resources: std.AutoHashMapUnmanaged(u32, Id) = .empty,
@@ -950,6 +1006,344 @@ const Emitter = struct {
         return id;
     }
 
+    /// OpSource: bare, or with -fspv-debug one per source file, with its
+    /// name and text.
+    fn sources(e: *Emitter) Error!void {
+        const dbg = e.dbg orelse return e.b.emit(.debug_names, .source, &.{ 5, 600 }); // HLSL
+        // (With the debug instruction set, DebugSource has them.)
+        if (!dbg.file or dbg.rich) return e.b.emit(.debug_names, .source, &.{ 5, 600 });
+        var done: std.AutoHashMapUnmanaged(Id, void) = .empty;
+        // The main file first, then the files it includes (each once).
+        const files = dbg.sm.files.items;
+        for (0..files.len + 1) |k| {
+            const fi: usize = if (k == 0) dbg.main_file else k - 1;
+            const file = files[fi];
+            if (k != 0 and file.included_from.isNone()) continue;
+            const id = try e.stringId(file.path);
+            if ((try done.fetchPut(e.arena, id, {})) != null) continue;
+            if (!dbg.text) {
+                try e.b.emit(.debug_names, .source, &.{ 5, 600, id });
+                continue;
+            }
+            // An instruction is at most 65535 words: the rest of a long
+            // file goes in OpSourceContinued.
+            var rest = file.text;
+            var first = true;
+            while (first or rest.len > 0) : (first = false) {
+                const n = textChunk(rest);
+                if (first) {
+                    try e.b.emitWithString(.debug_names, .source, &.{ 5, 600, id }, rest[0..n], &.{});
+                } else try e.b.emitWithString(.debug_names, .source_continued, &.{}, rest[0..n], &.{});
+                rest = rest[n..];
+            }
+        }
+    }
+
+    /// How much of `text` fits in one instruction's string (not ending
+    /// inside a UTF-8 sequence).
+    fn textChunk(text: []const u8) usize {
+        var n = @min(text.len, 65530 * 4);
+        while (n < text.len and n > 0 and text[n] & 0xc0 == 0x80) n -= 1;
+        return n;
+    }
+
+    // ------------------------------------------------------------------
+    // NonSemantic.Shader.DebugInfo.100
+
+    /// A debug instruction (its number in the set) with id operands.
+    fn dbgInst(e: *Emitter, section: builder.Section, inst: u32, operands: []const u32) Error!Id {
+        const id = e.b.newId();
+        var ops: std.ArrayList(u32) = .empty;
+        try ops.appendSlice(e.arena, &.{ e.void_id, id, e.rich.?.set, inst });
+        try ops.appendSlice(e.arena, operands);
+        try e.b.emit(section, .ext_inst, ops.items);
+        return id;
+    }
+
+    fn richInit(e: *Emitter) Error!void {
+        const dbg = e.dbg.?;
+        const m = e.m;
+        try e.extension("SPV_KHR_non_semantic_info");
+        const set = try e.extInstImport("NonSemantic.Shader.DebugInfo.100");
+        e.rich = .{
+            .set = set,
+            .funcs = try e.arena.alloc(Id, m.functions.items.len),
+            .func_scopes = try e.arena.alloc(ir.ScopeId, m.functions.items.len),
+            .scopes = try e.arena.alloc(Id, m.scopes.items.len),
+            .inlined = try e.arena.alloc(Id, m.inline_sites.items.len),
+        };
+        const r = &e.rich.?;
+        @memset(r.funcs, 0);
+        @memset(r.func_scopes, .none);
+        @memset(r.scopes, 0);
+        @memset(r.inlined, 0);
+        for (m.scopes.items, 0..) |s, k| {
+            if (s.parent == .none and r.func_scopes[s.func] == .none) r.func_scopes[s.func] = @fromBackingInt(@intCast(k));
+        }
+        e.b.ext = .{ .void_ty = e.void_id, .set = set };
+        r.none = try e.dbgInst(.types_globals, 0, &.{}); // DebugInfoNone
+        r.expr = try e.dbgInst(.types_globals, 31, &.{}); // DebugExpression
+        // The main file, then the files it includes (each once).
+        const files = dbg.sm.files.items;
+        for (0..files.len + 1) |k| {
+            const file = files[if (k == 0) dbg.main_file else k - 1];
+            if (k != 0 and file.included_from.isNone()) continue;
+            const src = try e.dbgSource(file.path, if (dbg.text) file.text else null);
+            if (k != 0) continue;
+            r.main = src;
+            // (Version 1, DWARF 4, HLSL.)
+            r.cu = try e.dbgInst(.types_globals, 1, &.{ try e.constUint(1), try e.constUint(4), src, try e.constUint(5) });
+        }
+    }
+
+    /// The DebugSource of a file name (made once; `text` is for the first).
+    fn dbgSource(e: *Emitter, name: []const u8, text: ?[]const u8) Error!Id {
+        const r = &e.rich.?;
+        const name_id = try e.stringId(name);
+        if (r.sources.get(name_id)) |id| return id;
+        var id: Id = undefined;
+        if (text) |all| {
+            // (A string is at most 65535 words: the rest of a long file
+            // goes in DebugSourceContinued.)
+            var rest = all;
+            var first = true;
+            while (first or rest.len > 0) : (first = false) {
+                const n = textChunk(rest);
+                const str = e.b.newId();
+                try e.b.emitWithString(.debug_strings, .string, &.{str}, rest[0..n], &.{});
+                if (first) {
+                    id = try e.dbgInst(.types_globals, 35, &.{ name_id, str });
+                } else _ = try e.dbgInst(.types_globals, 102, &.{str});
+                rest = rest[n..];
+            }
+        } else id = try e.dbgInst(.types_globals, 35, &.{name_id});
+        try r.sources.put(e.arena, name_id, id);
+        return id;
+    }
+
+    /// Source, line and column of a position (the main file, 0 and 0 for
+    /// none).
+    fn dbgPos(e: *Emitter, loc_in: source.Loc) Error!DebugPos {
+        if (loc_in.isNone()) return .{ .src = e.rich.?.main, .line = 0, .col = 0 };
+        const sm = e.dbg.?.sm;
+        const loc = sm.fileLoc(loc_in);
+        const lc = sm.lineCol(loc);
+        const p = sm.presumedLine(loc.file, lc.line);
+        if (p.file.ptr != e.line_file.ptr or p.file.len != e.line_file.len) {
+            e.line_file = p.file;
+            e.line_file_id = try e.dbgSource(p.file, null);
+        }
+        return .{ .src = e.line_file_id, .line = p.line, .col = lc.col };
+    }
+
+    /// Bits of a value of `ty` as the debug types lay it out (members one
+    /// after the other).
+    fn dbgBits(e: *Emitter, ty: TypeId) u32 {
+        return switch (e.t.get(ty)) {
+            .scalar => |s| s.size() * 8,
+            .@"enum" => |en| en.underlying.size() * 8,
+            .vector => |v| v.elem.size() * 8 * v.len,
+            .matrix => |mx| mx.elem.size() * 8 * @as(u32, mx.rows) * mx.cols,
+            .array => |ar| ar.len *| e.dbgBits(ar.elem),
+            .@"struct" => |st| blk: {
+                var n: u32 = 0;
+                for (st.fields.items) |fld| n +|= e.dbgBits(fld.type);
+                break :blk n;
+            },
+            else => 0,
+        };
+    }
+
+    fn dbgBasic(e: *Emitter, s: Scalar) Error!Id {
+        const ty = try e.t.scalar(s);
+        const r = &e.rich.?;
+        if (r.types.get(ty)) |id| return id;
+        // Boolean, Float, Signed, Unsigned.
+        const encoding: u32 = if (s == .bool) 2 else if (s.isFloat()) 3 else switch (s) {
+            .uint, .min16uint, .uint16, .uint64, .uint8_4packed => 6,
+            else => 4,
+        };
+        const id = try e.dbgInst(.types_globals, 2, &.{ try e.stringId(s.name()), try e.constUint(s.size() * 8), try e.constUint(encoding), try e.constUint(0) });
+        try r.types.put(e.arena, ty, id);
+        return id;
+    }
+
+    /// The debug type of an HLSL type.
+    fn dbgType(e: *Emitter, ty: TypeId) Error!Id {
+        if (e.rich.?.types.get(ty)) |id| return id;
+        const zero = try e.constUint(0);
+        const public = try e.constUint(3); // FlagIsPublic
+        const id: Id = switch (e.t.get(ty)) {
+            .void => return e.void_id,
+            .scalar => |s| return e.dbgBasic(s),
+            .@"enum" => |en| return e.dbgBasic(en.underlying),
+            .vector => |v| try e.dbgInst(.types_globals, 6, &.{ try e.dbgBasic(v.elem), try e.constUint(v.len) }),
+            // (Rows, as the values are held.)
+            .matrix => |mx| try e.dbgInst(.types_globals, 5, &.{ try e.dbgType(try e.t.vector(mx.elem, mx.cols)), try e.constUint(mx.rows) }),
+            .array => |ar| if (ar.len == 0) try e.dbgOpaque(ty) else try e.dbgInst(.types_globals, 5, &.{ try e.dbgType(ar.elem), try e.constUint(ar.len) }),
+            .@"struct" => |st| blk: {
+                const r = &e.rich.?;
+                const name = try e.stringId(st.name);
+                var ops: std.ArrayList(u32) = .empty;
+                // (A structure; no position: the type table has none.)
+                try ops.appendSlice(e.arena, &.{ name, try e.constUint(1), r.main, zero, zero, r.cu, name, try e.constUint(e.dbgBits(ty)), public });
+                var offset: u32 = 0;
+                for (st.fields.items) |fld| {
+                    const bits = e.dbgBits(fld.type);
+                    try ops.append(e.arena, try e.dbgInst(.types_globals, 11, &.{ try e.stringId(fld.name), try e.dbgType(fld.type), r.main, zero, zero, try e.constUint(offset), try e.constUint(bits), public }));
+                    offset +|= bits;
+                }
+                break :blk try e.dbgInst(.types_globals, 10, ops.items);
+            },
+            else => try e.dbgOpaque(ty),
+        };
+        try e.rich.?.types.put(e.arena, ty, id);
+        return id;
+    }
+
+    /// Resources and the like: a structure with a name and nothing in it.
+    fn dbgOpaque(e: *Emitter, ty: TypeId) Error!Id {
+        const r = &e.rich.?;
+        const name = try e.stringId(try e.t.format(e.arena, ty));
+        const zero = try e.constUint(0);
+        return e.dbgInst(.types_globals, 10, &.{ name, try e.constUint(1), r.main, zero, zero, r.cu, name, r.none, try e.constUint(3) });
+    }
+
+    /// The DebugFunction of function `fi` (0 for one with no position).
+    fn dbgFunction(e: *Emitter, fi: u32) Error!Id {
+        const r = &e.rich.?;
+        if (r.funcs[fi] != 0) return r.funcs[fi];
+        const sc = r.func_scopes[fi];
+        if (sc == .none) return 0;
+        const f = e.m.functions.items[fi];
+        var is_wrapper = false;
+        for (e.m.entries.items) |en| {
+            if (en.wrapper == fi and en.func != fi) is_wrapper = true;
+            if (en.patch_wrapper) |pw| if (pw == fi) {
+                is_wrapper = true;
+            };
+        }
+        var tys: std.ArrayList(u32) = .empty;
+        try tys.appendSlice(e.arena, &.{ try e.constUint(3), try e.dbgType(f.ret) });
+        if (!is_wrapper) for (f.params) |p| try tys.append(e.arena, try e.dbgType(p.ty));
+        const fn_ty = try e.dbgInst(.types_globals, 8, tys.items);
+        // (The entry's wrapper is not in the source.)
+        const name = if (is_wrapper) "__zdxc_setup" else if (std.mem.startsWith(u8, f.name, "src.")) f.name[4..] else f.name;
+        const p = try e.dbgPos(e.m.scopes.items[sc.index()].loc);
+        const line = try e.constUint(p.line);
+        const id = try e.dbgInst(.types_globals, 20, &.{ try e.stringId(name), fn_ty, p.src, line, try e.constUint(p.col), r.cu, try e.stringId(""), try e.constUint(3), line });
+        r.funcs[fi] = id;
+        return id;
+    }
+
+    /// The DebugFunction or DebugLexicalBlock of a scope (0 for none).
+    fn dbgScope(e: *Emitter, s: ir.ScopeId) Error!Id {
+        if (s == .none) return 0;
+        const r = &e.rich.?;
+        if (r.scopes[s.index()] != 0) return r.scopes[s.index()];
+        const sc = e.m.scopes.items[s.index()];
+        const id = if (sc.parent == .none) try e.dbgFunction(sc.func) else blk: {
+            const parent = try e.dbgScope(sc.parent);
+            if (parent == 0) break :blk 0;
+            const p = try e.dbgPos(sc.loc);
+            break :blk try e.dbgInst(.types_globals, 21, &.{ p.src, try e.constUint(p.line), try e.constUint(p.col), parent });
+        };
+        r.scopes[s.index()] = id;
+        return id;
+    }
+
+    /// The DebugInlinedAt of an inlined call (0 for none).
+    fn dbgInlined(e: *Emitter, s: ir.InlineId) Error!Id {
+        if (s == .none) return 0;
+        const r = &e.rich.?;
+        if (r.inlined[s.index()] != 0) return r.inlined[s.index()];
+        const site = e.m.inline_sites.items[s.index()];
+        const scope = try e.dbgScope(site.scope);
+        if (scope == 0) return 0;
+        const line = try e.constUint((try e.dbgPos(site.loc)).line);
+        const outer = try e.dbgInlined(site.inlined_at);
+        const id = if (outer != 0) try e.dbgInst(.types_globals, 25, &.{ line, scope, outer }) else try e.dbgInst(.types_globals, 25, &.{ line, scope });
+        r.inlined[s.index()] = id;
+        return id;
+    }
+
+    /// DebugScope operands for what is in `scope`, inlined at `at`.
+    fn dbgScopeOf(e: *Emitter, scope: ir.ScopeId, at: ir.InlineId) Error![2]u32 {
+        const s = try e.dbgScope(scope);
+        if (s == 0) return .{ 0, 0 };
+        return .{ s, try e.dbgInlined(at) };
+    }
+
+    /// The DebugLocalVariable of variable `vi` of the function being
+    /// emitted (0 when it has no scope).
+    fn dbgVar(e: *Emitter, vi: u32) Error!Id {
+        const r = &e.rich.?;
+        if (r.vars[vi] != 0) return r.vars[vi];
+        const v = e.f.vars.items[vi];
+        const scope = try e.dbgScope(v.scope);
+        if (scope == 0) return 0;
+        const p = try e.dbgPos(v.loc);
+        var ops: std.ArrayList(u32) = .empty;
+        // (FlagIsLocal.)
+        try ops.appendSlice(e.arena, &.{ try e.stringId(v.name), try e.dbgType(v.ty), p.src, try e.constUint(p.line), try e.constUint(p.col), scope, try e.constUint(4) });
+        if (v.arg != 0) try ops.append(e.arena, try e.constUint(v.arg));
+        r.vars[vi] = try e.dbgInst(.types_globals, 26, ops.items);
+        return r.vars[vi];
+    }
+
+    /// DebugValue: variable (or a member of it) has the value from here.
+    fn dbgValue(e: *Emitter, dv: ir.DebugValue) Error!void {
+        const value = e.vals[dv.value.index()];
+        if (value == 0) return;
+        const v = e.f.vars.items[dv.variable];
+        const id = try e.dbgVar(dv.variable);
+        if (id == 0) return;
+        e.b.scope = try e.dbgScopeOf(v.scope, v.inlined_at);
+        e.b.line = try e.lineOf(.{ .loc = dv.loc });
+        var ops: std.ArrayList(u32) = .empty;
+        try ops.appendSlice(e.arena, &.{ id, value, e.rich.?.expr });
+        for (dv.path) |k| try ops.append(e.arena, try e.constInt(k));
+        _ = try e.dbgInst(.functions, 29, ops.items);
+    }
+
+    /// The module's globals and entry points.
+    fn dbgGlobals(e: *Emitter) Error!void {
+        const r = &e.rich.?;
+        const dbg = e.dbg.?;
+        const zero = try e.constUint(0);
+        for (e.m.globals.items, e.global_vars) |g, id| {
+            if (id == 0) continue;
+            const name = try e.stringId(g.name);
+            // (FlagIsDefinition.)
+            _ = try e.dbgInst(.types_globals, 18, &.{ name, try e.dbgType(g.ty), r.main, zero, zero, r.cu, name, id, try e.constUint(8) });
+        }
+        for (e.m.entries.items) |en| {
+            const func = try e.dbgFunction(en.wrapper);
+            if (func == 0) continue;
+            _ = try e.dbgInst(.types_globals, 107, &.{ func, r.cu, try e.stringId(dbg.signature), try e.stringId(dbg.args) });
+        }
+    }
+
+    /// The operands of the line instruction for a position
+    /// (`Builder.no_line` for none): OpLine's, or with the debug
+    /// instruction set the DebugSource and the constants of line and column.
+    fn lineOf(e: *Emitter, d: ir.DebugLoc) Error![3]u32 {
+        if (d.loc.isNone()) return Builder.no_line;
+        if (e.rich != null) {
+            const p = try e.dbgPos(d.loc);
+            return .{ p.src, try e.constUint(p.line), try e.constUint(p.col) };
+        }
+        const sm = e.dbg.?.sm;
+        const loc = sm.fileLoc(d.loc);
+        const lc = sm.lineCol(loc);
+        const p = sm.presumedLine(loc.file, lc.line);
+        if (p.file.ptr != e.line_file.ptr or p.file.len != e.line_file.len) {
+            e.line_file = p.file;
+            e.line_file_id = try e.stringId(p.file);
+        }
+        return .{ e.line_file_id, p.line, lc.col };
+    }
+
     /// An OpExtInstImport of `name` (made once).
     fn extInstImport(e: *Emitter, name: []const u8) Error!Id {
         if (std.mem.eql(u8, name, "GLSL.std.450")) {
@@ -1010,8 +1404,11 @@ const Emitter = struct {
     fn module(e: *Emitter) Error!void {
         const m = e.m;
         if (m.entries.items.len == 0 and m.exports.items.len == 0) return e.unsupported("no entry point", .{});
-        try e.b.emit(.debug_names, .source, &.{ 5, 600 }); // HLSL
+        try e.sources();
+        // (OpModuleProcessed is SPIR-V 1.1.)
+        if (e.dbg) |dbg| if (e.spv_minor >= 1) for (dbg.processed) |str| try e.b.emitWithString(.debug_processed, .module_processed, &.{}, str, &.{});
         e.void_id = try e.typeId(TypeTable.void_type);
+        if (e.dbg) |dbg| if (dbg.rich) try e.richInit();
         try e.cap(.shader);
         e.states = try e.arena.alloc(EntryState, @max(1, m.entries.items.len));
         for (e.states) |*st| st.* = .{};
@@ -1058,6 +1455,7 @@ const Emitter = struct {
             e.setEntry(@intCast(k));
             try e.emitInterface(entry);
         }
+        if (e.rich != null) try e.dbgGlobals();
 
         for (m.functions.items, e.func_ids) |f, id| {
             if (f.dead) continue;
@@ -1288,6 +1686,7 @@ const Emitter = struct {
     fn emitGlobals(e: *Emitter) Error!void {
         const m = e.m;
         e.global_vars = try e.arena.alloc(Id, m.globals.items.len);
+        @memset(e.global_vars, 0);
 
         try e.findCounterGlobals();
         try e.assignBindings();
@@ -2221,6 +2620,21 @@ const Emitter = struct {
         defer e.cur_fn = 0;
         e.cur_bindings = bindings;
         e.cur_binding_types = binding_types;
+        const lines = e.dbg != null and e.dbg.?.line;
+        e.b.line = Builder.no_line;
+        e.b.scope = .{ 0, 0 };
+        // Debug values by the instruction they come before (the others
+        // are at the end of their block).
+        var values_before: std.AutoHashMapUnmanaged(u32, std.ArrayList(u32)) = .empty;
+        if (e.rich) |*r| {
+            r.vars = try e.arena.alloc(Id, f.vars.items.len);
+            @memset(r.vars, 0);
+            for (f.dbg_values.items, 0..) |dv, k| {
+                if (dv.before == .none) continue;
+                const gop = try values_before.getOrPutValue(e.arena, dv.before.index(), .empty);
+                try gop.value_ptr.append(e.arena, @intCast(k));
+            }
+        }
         e.texel_places = .empty;
         e.mesh_places = .empty;
         e.indexed_locals = .empty;
@@ -2330,6 +2744,11 @@ const Emitter = struct {
                     e.vals[i] = e.b.newId();
                     try e.b.emit(.functions, .variable, &.{ ptr, e.vals[i], @backingInt(StorageClass.function) });
                 };
+                // -fspv-debug=line: the locals have their names.
+                if (lines) for (f.vars.items) |v| {
+                    const id = e.vals[v.storage.index()];
+                    if (id != 0 and f.inst(v.storage).op == .local_var) try e.b.emitWithString(.debug_names, .name, &.{id}, v.name, &.{});
+                };
                 var il_it = e.indexed_locals.valueIterator();
                 while (il_it.next()) |il| {
                     il.vars = try e.arena.alloc(Id, il.index_types.len);
@@ -2354,9 +2773,57 @@ const Emitter = struct {
                     try e.b.emit(.functions, .access_chain, ops.items);
                     if (rc.nonuniform) try e.markNonUniform(param_ids[k], rc.res_ty);
                 };
+                if (e.rich != null) {
+                    const fi: u32 = for (e.m.functions.items, 0..) |x, k| {
+                        if (x == f) break @intCast(k);
+                    } else unreachable;
+                    const func = try e.dbgFunction(fi);
+                    if (func != 0) {
+                        e.b.scope = .{ func, 0 };
+                        // (One definition: not the specializations.)
+                        if (fn_id == e.func_ids[fi]) _ = try e.dbgInst(.functions, 101, &.{ func, fn_id });
+                    }
+                    // The variables still in memory: DebugDeclare.
+                    for (f.vars.items, 0..) |v, vi| {
+                        const storage = e.vals[v.storage.index()];
+                        const op = f.inst(v.storage).op;
+                        if (storage == 0 or storage & recipe_tag != 0 or (op != .local_var and op != .param)) continue;
+                        if (op == .param and !f.params[op.param].by_ref) continue;
+                        const id = try e.dbgVar(@intCast(vi));
+                        if (id == 0) continue;
+                        e.b.scope = try e.dbgScopeOf(v.scope, v.inlined_at);
+                        _ = try e.dbgInst(.functions, 28, &.{ id, storage, e.rich.?.expr });
+                    }
+                    if (func != 0) e.b.scope = .{ func, 0 };
+                }
             }
             const blk = f.blocks.items[bi];
-            for (blk.insts.items) |r| try e.emitInst(r);
+            for (blk.insts.items) |r| {
+                if (lines) {
+                    const d = f.locOf(r);
+                    if (e.rich != null) {
+                        if (values_before.get(r.index())) |list| for (list.items) |k| try e.dbgValue(f.dbg_values.items[k]);
+                        if (!d.loc.isNone()) e.b.scope = try e.dbgScopeOf(d.scope, d.inlined_at);
+                    }
+                    const ln = try e.lineOf(d);
+                    if (f.inst(r).op != .phi) {
+                        e.b.line = ln;
+                    } else if (e.rich == null) {
+                        // Phis record where their operands are, and only
+                        // an OpLine may come between two.
+                        if (ln[0] != 0) e.b.line = ln;
+                        try e.b.flushLine();
+                    }
+                }
+                try e.emitInst(r);
+            }
+            if (e.rich != null) {
+                for (f.dbg_values.items) |dv| {
+                    if (dv.before == .none and dv.block.index() == bi) try e.dbgValue(dv);
+                }
+                if (!blk.term_loc.loc.isNone()) e.b.scope = try e.dbgScopeOf(blk.term_loc.scope, blk.term_loc.inlined_at);
+            }
+            if (lines) e.b.line = try e.lineOf(blk.term_loc);
             switch (blk.merge) {
                 .none => {},
                 // [flatten] / [branch]: SelectionControl Flatten /

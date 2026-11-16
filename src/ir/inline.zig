@@ -254,9 +254,32 @@ fn newBlock(a: Allocator, f: *ir.Function, blk: ir.Block) Error!u32 {
 }
 
 fn newInst(a: Allocator, f: *ir.Function, inst: ir.Inst) Error!Ref {
-    try f.insts.append(a, inst);
-    return @fromBackingInt(@intCast(f.insts.items.len - 1));
+    return f.appendInst(a, inst);
 }
+
+/// Debug information of one inlined call: positions in the callee become
+/// positions inlined at the call (`site`; `.none` without debug
+/// information).
+const Inlined = struct {
+    m: *ir.Module,
+    site: ir.InlineId = .none,
+    /// The callee's own inlined calls, as copies inlined at `site`.
+    copies: std.AutoHashMapUnmanaged(u32, ir.InlineId) = .empty,
+
+    fn loc(x: *Inlined, d: ir.DebugLoc) Error!ir.DebugLoc {
+        if (x.site == .none or d.loc.isNone()) return .none;
+        return .{ .loc = d.loc, .scope = d.scope, .inlined_at = try x.at(d.inlined_at) };
+    }
+
+    fn at(x: *Inlined, id: ir.InlineId) Error!ir.InlineId {
+        if (id == .none) return x.site;
+        if (x.copies.get(id.index())) |c| return c;
+        const s = x.m.inline_sites.items[id.index()];
+        const c = try x.m.addInlineSite(.{ .loc = s.loc, .scope = s.scope, .inlined_at = try x.at(s.inlined_at) });
+        try x.copies.put(x.m.arena, id.index(), c);
+        return c;
+    }
+};
 
 /// Inlines every call in `f` whose callee has an inlinable shape (calls
 /// in the copies included); callees of calls that stay go to `work`.
@@ -280,7 +303,7 @@ fn inlineCalls(m: *ir.Module, f: *ir.Function, shapes: []const ?Shape, work: *st
                 continue;
             }
             const callee = m.functions.items[call.func];
-            const value = try inlineOne(a, m.types, f, @intCast(bi), pos, call.args, callee, shape);
+            const value = try inlineOne(m, f, @intCast(bi), pos, call.args, callee, shape);
             try results.put(a, r.index(), value);
             // The rest of the block moved to the continuation block, which
             // is later in the block list.
@@ -327,7 +350,15 @@ fn mapTerm(term: ir.Terminator, mp: anytype) ir.Terminator {
 
 /// Inlines `callee(args)`, the instruction at `pos` of block `bi` of `f`.
 /// Returns the value the call produced (`.none` for void).
-fn inlineOne(a: Allocator, m_types: *TypeTable, f: *ir.Function, bi: u32, pos: usize, args: []const Ref, callee: *const ir.Function, shape: Shape) Error!Ref {
+fn inlineOne(m: *ir.Module, f: *ir.Function, bi: u32, pos: usize, args: []const Ref, callee: *const ir.Function, shape: Shape) Error!Ref {
+    const a = m.arena;
+    const m_types = m.types;
+    // Debug information: the copies are inlined at the call's position;
+    // what the inlining itself adds is at the call.
+    const call_loc = f.locOf(f.blocks.items[bi].insts.items[pos]);
+    var inl: Inlined = .{ .m = m };
+    if (f.debug) inl.site = try m.addInlineSite(.{ .loc = call_loc.loc, .scope = call_loc.scope, .inlined_at = call_loc.inlined_at });
+    defer f.cur_loc = .none;
     // Continuation: the instructions after the call, the terminator and
     // the merge.
     const cont = try newBlock(a, f, .{});
@@ -335,6 +366,8 @@ fn inlineOne(a: Allocator, m_types: *TypeTable, f: *ir.Function, bi: u32, pos: u
         const blk = &f.blocks.items[bi];
         try f.blocks.items[cont].insts.appendSlice(a, blk.insts.items[pos + 1 ..]);
         f.blocks.items[cont].term = blk.term;
+        f.blocks.items[cont].term_loc = blk.term_loc;
+        blk.term_loc = call_loc;
         f.blocks.items[cont].merge = blk.merge;
         f.blocks.items[cont].selection_control = blk.selection_control;
         blk.insts.shrinkRetainingCapacity(pos);
@@ -352,6 +385,7 @@ fn inlineOne(a: Allocator, m_types: *TypeTable, f: *ir.Function, bi: u32, pos: u
     @memset(imap, .none);
     for (callee.blocks.items) |blk| for (blk.insts.items) |r| {
         const inst = callee.inst(r);
+        f.cur_loc = try inl.loc(callee.locOf(r));
         imap[r.index()] = switch (inst.op) {
             .param => |p| args[p],
             else => try newInst(a, f, inst),
@@ -363,10 +397,12 @@ fn inlineOne(a: Allocator, m_types: *TypeTable, f: *ir.Function, bi: u32, pos: u
         callee: *const ir.Function,
         args: []const Ref,
         al: Allocator,
+        inl: *Inlined,
         pub fn map(c: *const @This(), x: Ref) Ref {
             if (x == .none) return x;
             if (c.imap[x.index()] != .none) return c.imap[x.index()];
             const inst = c.callee.inst(x);
+            c.f.cur_loc = c.inl.loc(c.callee.locOf(x)) catch .none;
             const y = switch (inst.op) {
                 .param => |p| c.args[p],
                 else => newInst(c.al, c.f, inst) catch return x,
@@ -376,7 +412,7 @@ fn inlineOne(a: Allocator, m_types: *TypeTable, f: *ir.Function, bi: u32, pos: u
             return y;
         }
     };
-    const mp = &Map{ .imap = imap, .f = f, .callee = callee, .args = args, .al = a };
+    const mp = &Map{ .imap = imap, .f = f, .callee = callee, .args = args, .al = a, .inl = &inl };
     for (callee.blocks.items) |blk| for (blk.insts.items) |r| {
         const inst = callee.inst(r);
         if (inst.op == .param) continue;
@@ -406,9 +442,10 @@ fn inlineOne(a: Allocator, m_types: *TypeTable, f: *ir.Function, bi: u32, pos: u
         for (shape.wrap.in_loops) |rl| try ret_loop.put(a, rl.block, rl.loops[0]);
     }
     if (shape == .wrap) {
-        exit = try newBlock(a, f, .{});
-        const header = try newBlock(a, f, .{});
-        const latch = try newBlock(a, f, .{ .term = .{ .br = @fromBackingInt(@intCast(header)) } });
+        f.cur_loc = call_loc;
+        exit = try newBlock(a, f, .{ .term_loc = call_loc });
+        const header = try newBlock(a, f, .{ .term_loc = call_loc });
+        const latch = try newBlock(a, f, .{ .term = .{ .br = @fromBackingInt(@intCast(header)) }, .term_loc = call_loc });
         f.blocks.items[header].merge = .{ .loop = .{ .merge = @fromBackingInt(@intCast(exit)), .@"continue" = @fromBackingInt(@intCast(latch)), .unroll = .auto } };
         f.blocks.items[header].term = .{ .br = @fromBackingInt(@intCast(bmap[0])) };
         entry_target = header;
@@ -430,6 +467,7 @@ fn inlineOne(a: Allocator, m_types: *TypeTable, f: *ir.Function, bi: u32, pos: u
             .ret => |v| blk: {
                 if (shape == .wrap) {
                     if (ret_var != .none and v != .none) {
+                        f.cur_loc = try inl.loc(src.term_loc);
                         const st = try newInst(a, f, .{ .op = .{ .store = .{ .ptr = ret_var, .value = mp.map(v) } }, .ty = TypeTable.void_type });
                         try insts.append(a, st);
                     }
@@ -461,7 +499,7 @@ fn inlineOne(a: Allocator, m_types: *TypeTable, f: *ir.Function, bi: u32, pos: u
             .selection => |mb| .{ .selection = B.map(bmap, mb) },
             .loop => |l| .{ .loop = .{ .merge = B.map(bmap, l.merge), .@"continue" = B.map(bmap, l.@"continue"), .unroll = l.unroll } },
         };
-        f.blocks.items[bmap[k]] = .{ .insts = insts, .term = term, .merge = merge, .selection_control = src.selection_control };
+        f.blocks.items[bmap[k]] = .{ .insts = insts, .term = term, .term_loc = try inl.loc(src.term_loc), .merge = merge, .selection_control = src.selection_control };
     }
     // The merge block of each loop around a return leaves for the next
     // loop out's merge (or the one-trip loop's) when the flag is set; what
@@ -480,6 +518,15 @@ fn inlineOne(a: Allocator, m_types: *TypeTable, f: *ir.Function, bi: u32, pos: u
         };
     }
     f.blocks.items[bi].term = .{ .br = @fromBackingInt(@intCast(entry_target)) };
+    // The callee's variables, in the storage copied for them.
+    if (inl.site != .none) for (callee.vars.items) |v| {
+        const storage = imap[v.storage.index()];
+        if (storage == .none) continue;
+        var copy = v;
+        copy.storage = storage;
+        copy.inlined_at = try inl.at(v.inlined_at);
+        try f.vars.append(a, copy);
+    };
     return result;
 }
 

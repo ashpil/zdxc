@@ -62,6 +62,7 @@ fn runOrFail(io: Io, arena: std.mem.Allocator, argv: []const [:0]const u8, ctx: 
     if (r.status != .ok) return @backingInt(r.status);
     if (r.object) |bytes| try write(io, arena, ctx.outputs, stderr, r.object_name.?, bytes) orelse return 1;
     if (r.root_signature) |bytes| try write(io, arena, ctx.outputs, stderr, r.root_signature_name.?, bytes) orelse return 1;
+    if (r.pdb) |bytes| try write(io, arena, ctx.outputs, stderr, r.pdb_name.?, bytes) orelse return 1;
     if (r.preprocessed) |text| {
         if (r.preprocessed_name) |path| try write(io, arena, ctx.outputs, stderr, path, text) orelse return 1 else try stdout.writeAll(text);
     }

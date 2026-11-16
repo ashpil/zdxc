@@ -484,8 +484,7 @@ fn indexIs(t: *const TypeTable, a: Allocator, f: *ir.Function, index: Ref, k: u3
 fn addInst(t: *const TypeTable, a: Allocator, f: *ir.Function, inst: ir.Inst) Error!Ref {
     var x = inst;
     if (x.ptr == .none) x.ty = t.canonical(x.ty);
-    try f.insts.append(a, x);
-    return @fromBackingInt(@intCast(f.insts.items.len - 1));
+    return f.appendInst(a, x);
 }
 
 /// Calls `ctx.use(r)` for every operand of `op` (not `.none`).
@@ -706,6 +705,16 @@ fn splitLocals(m: *ir.Module, f: *ir.Function) Error!bool {
         }
         leaf_base[i] = @intCast(leaves.items.len);
         try addLeaves(a, f, t, f.inst(@fromBackingInt(@intCast(i))).ty, &leaves);
+        // Debug information: the variable is in its leaves now.
+        for (f.vars.items, 0..) |v, vi| {
+            if (v.storage.index() != i) continue;
+            var paths_out: std.ArrayList([]const u32) = .empty;
+            var prefix: std.ArrayList(u32) = .empty;
+            try leafPaths(a, t, f.inst(v.storage).ty, &prefix, &paths_out);
+            for (paths_out.items, leaves.items[leaf_base[i]..]) |path, leaf| {
+                try f.var_parts.append(a, .{ .storage = leaf, .variable = @intCast(vi), .path = path });
+            }
+        }
     }
     defer for (0..n) |i| if (cand[i]) {
         // Split: the aggregate local is gone (the emitter declares every
@@ -717,6 +726,8 @@ fn splitLocals(m: *ir.Module, f: *ir.Function) Error!bool {
         var out: std.ArrayList(Ref) = .empty;
         for (blk.insts.items) |r| {
             const inst = f.inst(r);
+            f.cur_loc = f.locOf(r);
+            defer f.cur_loc = .none;
             switch (inst.op) {
                 .access => if (root[r.index()] != .none and cand[root[r.index()].index()]) {
                     const rt = root[r.index()];
@@ -1040,6 +1051,20 @@ fn addLeaves(a: Allocator, f: *ir.Function, t: *TypeTable, ty: TypeId, out: *std
         .@"struct" => |st| for (st.fields.items) |fld| try addLeaves(a, f, t, fld.type, out),
         .array => |x| for (0..x.len) |_| try addLeaves(a, f, t, x.elem, out),
         else => try out.append(a, try addInst(t, a, f, .{ .op = .local_var, .ty = ty, .ptr = .function })),
+    }
+}
+
+/// The path of each leaf, in the order of `addLeaves`.
+fn leafPaths(a: Allocator, t: *TypeTable, ty: TypeId, prefix: *std.ArrayList(u32), out: *std.ArrayList([]const u32)) Error!void {
+    const n: u32, const st: ?*types.StructInfo, const elem: TypeId = switch (t.get(ty)) {
+        .@"struct" => |s| .{ @intCast(s.fields.items.len), s, 0 },
+        .array => |x| .{ x.len, null, x.elem },
+        else => return out.append(a, try a.dupe(u32, prefix.items)),
+    };
+    for (0..n) |k| {
+        try prefix.append(a, @intCast(k));
+        try leafPaths(a, t, if (st) |s| s.fields.items[k].type else elem, prefix, out);
+        _ = prefix.pop();
     }
 }
 
@@ -1484,19 +1509,50 @@ fn promote(m: *ir.Module, f: *ir.Function) Error!void {
             }
         }
     }
+    // Debug information: the variables (and members) the promoted locals
+    // hold. Their values are recorded where the stores and phis were.
+    const Owner = struct { variable: u32, path: []const u32 };
+    var owners: std.AutoHashMapUnmanaged(u32, std.ArrayList(Owner)) = .empty;
+    if (f.vars.items.len > 0) {
+        for (f.vars.items, 0..) |v, vi| {
+            if (var_of[v.storage.index()] == none) continue;
+            const gop = try owners.getOrPutValue(a, v.storage.index(), .empty);
+            try gop.value_ptr.append(a, .{ .variable = @intCast(vi), .path = &.{} });
+        }
+        for (f.var_parts.items) |p| {
+            if (var_of[p.storage.index()] == none) continue;
+            const gop = try owners.getOrPutValue(a, p.storage.index(), .empty);
+            try gop.value_ptr.append(a, .{ .variable = p.variable, .path = p.path });
+        }
+    }
     // Rewrite every block: drop promoted loads / stores / locals, place the
     // remaining phis first, map operands.
     for (f.blocks.items, 0..) |*blk, bi| {
         var out: std.ArrayList(Ref) = .empty;
-        for (phis[bi].items) |p| if (!repl.contains(p.r.index())) try out.append(a, p.r);
+        // Values recorded in this block that have no place yet: before
+        // the next instruction kept.
+        var unplaced = f.dbg_values.items.len;
+        for (phis[bi].items) |p| if (!repl.contains(p.r.index())) {
+            try out.append(a, p.r);
+            if (owners.get(pvars.items[p.v].index())) |os| for (os.items) |o| {
+                try f.dbg_values.append(a, .{ .block = @fromBackingInt(@intCast(bi)), .variable = o.variable, .path = o.path, .value = p.r });
+            };
+        };
         for (blk.insts.items) |r| {
             const op = f.inst(r).op;
             switch (op) {
                 .local_var => if (var_of[r.index()] != none) continue,
                 .load => |p| if (var_of[p.index()] != none) continue,
-                .store => |s| if (var_of[s.ptr.index()] != none) continue,
+                .store => |s| if (var_of[s.ptr.index()] != none) {
+                    if (owners.get(s.ptr.index())) |os| for (os.items) |o| {
+                        try f.dbg_values.append(a, .{ .block = @fromBackingInt(@intCast(bi)), .variable = o.variable, .path = o.path, .value = rs.map(s.value), .loc = f.locOf(r).loc });
+                    };
+                    continue;
+                },
                 else => {},
             }
+            for (f.dbg_values.items[unplaced..]) |*dv| dv.before = r;
+            unplaced = f.dbg_values.items.len;
             try out.append(a, r);
         }
         for (out.items) |r| {

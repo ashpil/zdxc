@@ -368,8 +368,7 @@ fn componentCount(t: *TypeTable, ty: TypeId) ?usize {
 }
 
 fn addInst(a: Allocator, f: *ir.Function, inst: ir.Inst) Allocator.Error!Ref {
-    try f.insts.append(a, inst);
-    return @enumFromInt(f.insts.items.len - 1);
+    return f.appendInst(a, inst);
 }
 
 /// Folds operations on scalar and vector constants in place (vector
@@ -418,6 +417,8 @@ pub fn fold(a: Allocator, t: *TypeTable, f: *ir.Function) Allocator.Error!void {
             // New scalar constants go just before the folded instruction.
             const st = try t.scalar(rs);
             const parts = try a.alloc(Ref, n);
+            f.cur_loc = f.locOf(r);
+            defer f.cur_loc = .none;
             for (parts, comps[0..n]) |*p, c| {
                 p.* = try addInst(a, f, .{ .op = .{ .constant = c }, .ty = st });
                 try blk.insts.insert(a, pos, p.*);
@@ -689,6 +690,8 @@ fn unrollOne(a: Allocator, t: *TypeTable, f: *ir.Function, h: u32, set: []const 
         for (0..n_blocks) |bi| {
             if (!set[bi] or bi == check) continue;
             for (f.blocks.items[bi].insts.items) |r| {
+                f.cur_loc = f.locOf(r);
+                defer f.cur_loc = .none;
                 try imap.put(a, r.index(), try addInst(a, f, f.inst(r)));
             }
         }
@@ -719,7 +722,7 @@ fn unrollOne(a: Allocator, t: *TypeTable, f: *ir.Function, h: u32, set: []const 
             }
             const mapBlock = struct {
                 fn g(bm: *const std.AutoHashMapUnmanaged(u32, u32), b: BlockId) BlockId {
-                    return if (bm.get(b.index())) |x| @enumFromInt(x) else b;
+                    return if (bm.get(b.index())) |x| @fromBackingInt(@intCast(x)) else b;
                 }
             }.g;
             var term = src.term;
@@ -739,15 +742,15 @@ fn unrollOne(a: Allocator, t: *TypeTable, f: *ir.Function, h: u32, set: []const 
                 .selection => |b| .{ .selection = mapBlock(&bmap, b) },
                 .loop => |l| .{ .loop = .{ .merge = mapBlock(&bmap, l.merge), .@"continue" = mapBlock(&bmap, l.@"continue"), .unroll = l.unroll } },
             };
-            f.blocks.items[nb] = .{ .insts = insts, .term = term, .merge = mg, .selection_control = src.selection_control };
+            f.blocks.items[nb] = .{ .insts = insts, .term = term, .term_loc = src.term_loc, .merge = mg, .selection_control = src.selection_control };
         }
         entries[iter] = bmap.get(body).?;
         conts[iter] = bmap.get(cont).?;
     }
     for (conts, 0..) |c, iter| {
-        f.blocks.items[c].term = .{ .br = @enumFromInt(if (iter + 1 < entries.len) entries[iter + 1] else merge) };
+        f.blocks.items[c].term = .{ .br = @fromBackingInt(@intCast(if (iter + 1 < entries.len) entries[iter + 1] else merge)) };
     }
-    f.blocks.items[pre].term = .{ .br = @enumFromInt(if (entries.len > 0) entries[0] else merge) };
+    f.blocks.items[pre].term = .{ .br = @fromBackingInt(@intCast(if (entries.len > 0) entries[0] else merge)) };
     return true;
 }
 

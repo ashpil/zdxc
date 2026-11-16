@@ -15,6 +15,11 @@
 //! extract's indices, loop controls) are skipped, and every operand word of
 //! any other instruction counts, so a literal that happens to equal an id
 //! can only keep an instruction, never remove one.
+//!
+//! Debug information (the instructions of a NonSemantic set) keeps
+//! nothing: a value or variable only it uses goes, and with it the
+//! instruction that described it, so a module's code is the same with and
+//! without -fspv-debug.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -154,8 +159,28 @@ fn instructions(a: Allocator, words: []const u32, section: Section, out: *std.Ar
     }
 }
 
+/// Whether `w` is an instruction of one of the sets `nonsemantic`.
+fn isDebug(w: []const u32, nonsemantic: []const u32) bool {
+    if (@as(u16, @truncate(w[0])) != 12 or w.len < 5) return false;
+    return std.mem.indexOfScalar(u32, nonsemantic, w[3]) != null;
+}
+
 pub fn run(a: Allocator, b: *builder.Builder) !void {
     const bound = b.next_id;
+    // The NonSemantic sets: OpExtInstImport result, name.
+    var nonsemantic: std.ArrayList(u32) = .empty;
+    {
+        var imports: std.ArrayList(Inst) = .empty;
+        try instructions(a, b.sections.getPtr(.ext_inst_imports).items, .ext_inst_imports, &imports);
+        for (imports.items) |in| {
+            const w = b.sections.getPtr(.ext_inst_imports).items[in.start..][0..in.len];
+            if (@as(u16, @truncate(w[0])) != 11 or w.len < 3) continue;
+            if (std.mem.startsWith(u8, std.mem.sliceAsBytes(w[2..]), "NonSemantic.")) try nonsemantic.append(a, w[1]);
+        }
+    }
+    // Uses by debug information, which keep no value or variable.
+    const weak = try a.alloc(u32, bound);
+    @memset(weak, 0);
     const uses = try a.alloc(u32, bound);
     @memset(uses, 0);
     // Instructions of the sections that use ids (not names, decorations or
@@ -166,8 +191,10 @@ pub fn run(a: Allocator, b: *builder.Builder) !void {
     }
     for (insts.items) |in| {
         const w = b.sections.getPtr(in.section).items[in.start..][0..in.len];
+        const debug = isDebug(w, nonsemantic.items);
         for (w[1..], 1..) |x, i| if (x < bound and idWord(w, i)) {
             uses[x] += 1;
+            if (debug and i > 4) weak[x] += 1;
         };
     }
     // Ids decorations take (OpDecorateId's operands).
@@ -212,6 +239,21 @@ pub fn run(a: Allocator, b: *builder.Builder) !void {
             const w = b.sections.getPtr(in.section).items[in.start..][0..in.len];
             const op: u16 = @truncate(w[0]);
             const is_type = in.section == .types_globals and (op == 28 or op == 29 or op == 30 or op == 32);
+            // A debug instruction goes with what it describes.
+            if (isDebug(w, nonsemantic.items)) {
+                const stale = for (w[5..]) |x| {
+                    if (x < bound and dead[x]) break true;
+                } else false;
+                if (!stale) continue;
+                gone[k] = true;
+                if (w[2] < bound) dead[w[2]] = true;
+                changed = true;
+                for (w[1..], 1..) |x, i| if (x < bound and uses[x] > 0 and idWord(w, i)) {
+                    uses[x] -= 1;
+                    if (i > 4 and weak[x] > 0) weak[x] -= 1;
+                };
+                continue;
+            }
             const ok = switch (in.section) {
                 .functions => (removable(op, w) or op == 1) and w.len >= 3,
                 .types_globals => (op == 59 and w.len >= 4 and droppableStorage(w[3])) or // OpVariable
@@ -227,7 +269,10 @@ pub fn run(a: Allocator, b: *builder.Builder) !void {
             const result = if (is_type) w[1] else w[2];
             // (The instruction's own result word counted once.)
             if (result >= bound) continue;
-            if (if (is_type) type_uses[result] > 0 else uses[result] > 1) continue;
+            // (Constants and types are debug information's own: line
+            // numbers, sizes.)
+            const value = in.section == .functions or op == 59;
+            if (if (is_type) type_uses[result] > 0 else uses[result] - (if (value) weak[result] else 0) > 1) continue;
             gone[k] = true;
             dead[result] = true;
             changed = true;
