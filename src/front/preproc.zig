@@ -9,6 +9,7 @@ const Allocator = std.mem.Allocator;
 const source = @import("source.zig");
 const lexer = @import("lexer.zig");
 const unicode = @import("unicode.zig");
+const literal = @import("literal.zig");
 const Diagnostics = @import("../diag.zig").Diagnostics;
 const Report = @import("../diag.zig").Report;
 const Token = lexer.Token;
@@ -1428,14 +1429,17 @@ const Eval = struct {
                 e.pos += 1;
                 return v;
             },
-            .number => return parseInt(t.text) orelse {
-                e.pp.diags.err(t.loc, "invalid integer constant in preprocessor expression", .{});
-                return error.EvalFailed;
+            .number => return e.number(t),
+            .char => {
+                const c = literal.parseChar(t.text);
+                if (!literal.reportChar(e.pp.diags, t.loc, c)) return error.EvalFailed;
+                // `''` is no token at all.
+                if (c.count == 0) {
+                    e.pos -= 1;
+                    return e.fail("invalid token at start of a preprocessor expression");
+                }
+                return .{ .v = c.value };
             },
-            .char => return .{ .v = lexer.charValue(t.text) orelse {
-                e.pp.diags.err(t.loc, "empty character constant", .{});
-                return error.EvalFailed;
-            } },
             .identifier => {
                 // Remaining identifiers are 0, except C++ true/false.
                 return .{ .v = @intFromBool(std.mem.eql(u8, t.text, "true")) };
@@ -1446,35 +1450,29 @@ const Eval = struct {
             },
         }
     }
-};
 
-fn parseInt(text: []const u8) ?Value {
-    var end = text.len;
-    var unsigned = false;
-    while (end > 0) {
-        const c = text[end - 1];
-        if (c == 'u' or c == 'U') {
-            unsigned = true;
-        } else if (c != 'l' and c != 'L') break;
-        end -= 1;
+    /// A pp-number: an integer of the widest type, unsigned with a `u`
+    /// suffix or when it does not fit the signed one. Rejected as clang's
+    /// NumericLiteralParser rejects it.
+    fn number(e: *Eval, t: Token) EvalError!Value {
+        const lit = literal.scan(t.text);
+        if (literal.checkDigits(t.text, lit)) |p| {
+            literal.report(e.pp.diags, t.loc, p);
+            return error.EvalFailed;
+        }
+        const suffix = t.text[lit.end..];
+        if (!(if (lit.float) literal.isFloatSuffix(suffix) else literal.isIntSuffix(suffix))) {
+            e.pp.diags.err(t.loc.advance(@intCast(lit.end)), "invalid suffix '{s}' on {s} constant", .{ suffix, if (lit.float) "floating" else "integer" });
+            return error.EvalFailed;
+        }
+        if (lit.float) {
+            e.pp.diags.err(t.loc, "floating point literal in preprocessor expression", .{});
+            return error.EvalFailed;
+        }
+        const v = literal.parseDigits(t.text[0..lit.end]) orelse unreachable; // checkDigits
+        return .{ .v = @bitCast(v), .unsigned = std.mem.indexOfAny(u8, suffix, "uU") != null or v > std.math.maxInt(i64) };
     }
-    const digits = text[0..end];
-    if (digits.len == 0) return null;
-    var base: u8 = 10;
-    var body = digits;
-    if (digits.len > 2 and digits[0] == '0' and (digits[1] == 'x' or digits[1] == 'X')) {
-        base = 16;
-        body = digits[2..];
-    } else if (digits.len > 2 and digits[0] == '0' and (digits[1] == 'b' or digits[1] == 'B')) {
-        base = 2;
-        body = digits[2..];
-    } else if (digits.len > 1 and digits[0] == '0') {
-        base = 8;
-        body = digits[1..];
-    }
-    const v = std.fmt.parseInt(u64, body, base) catch return null;
-    return .{ .v = @bitCast(v), .unsigned = unsigned or v > std.math.maxInt(i64) };
-}
+};
 
 // -------------------------------------------------------------------------
 // Tests
@@ -1588,6 +1586,20 @@ test "an empty character constant is diagnosed in #if" {
     defer t.deinit();
     _ = try t.output();
     try std.testing.expectEqual(@as(u32, 1), t.diags.error_count);
+}
+
+test "#if reads literals as clang does" {
+    // A `char` is signed.
+    try expectPP("#if '\\xff' < 0 && '\\377' == -1 && '\\e' == 27\ngood\n#endif", "good");
+    try expectPP("#if 18446744073709551615 > 0 && 0xFFFFFFFFFFFFFFFF > 0 && 1ull && 0b101 == 5\ngood\n#endif", "good");
+    for ([_][]const u8{ "09", "0x", "1f", "1.5", "0x1p3", "18446744073709551616", "1lL", "'\\x'", "'\\x141'", "'\\400'" }) |bad| {
+        var buf: [64]u8 = undefined;
+        var t: TestPP = .{};
+        try t.init(&.{}, try std.fmt.bufPrint(&buf, "#if {s}\n#endif\n", .{bad}), .{});
+        defer t.deinit();
+        _ = try t.output();
+        try std.testing.expectEqual(@as(u32, 1), t.diags.error_count);
+    }
 }
 
 test "#if short-circuits && || ?:" {
