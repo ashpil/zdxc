@@ -77,7 +77,11 @@ fn avoidConcat(a: Token, b: Token) bool {
     if (a.text.len == 0 or b.text.len == 0) return false;
     const last = a.text[a.text.len - 1];
     const first = b.text[0];
-    if (lexer.isIdentChar(last) and (lexer.isIdentChar(first) or first == '.')) return true;
+    // (Non-ASCII ends an identifier or number only as part of it, and
+    // starts one only as an identifier.)
+    const ident_last = lexer.isIdentChar(last) or (last >= 0x80 and (a.kind == .identifier or a.kind == .number));
+    const ident_first = lexer.isIdentChar(first) or (first >= 0x80 and b.kind == .identifier);
+    if (ident_last and (ident_first or first == '.')) return true;
     if (a.kind == .number and (first == '+' or first == '-' or first == '.')) return true;
     var buf: [8]u8 = undefined;
     if (a.text.len > 3 or b.text.len > 3 or !a.kind.isPunct() or !b.kind.isPunct()) return false;

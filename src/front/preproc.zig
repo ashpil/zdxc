@@ -8,6 +8,7 @@ const BumpArena = @import("../BumpArena.zig");
 const Allocator = std.mem.Allocator;
 const source = @import("source.zig");
 const lexer = @import("lexer.zig");
+const unicode = @import("unicode.zig");
 const Diagnostics = @import("../diag.zig").Diagnostics;
 const Report = @import("../diag.zig").Report;
 const Token = lexer.Token;
@@ -32,6 +33,9 @@ pub const Options = struct {
     spirv_minor: u32 = 0,
     enable_16bit: bool = false,
     hlsl_version: u16 = 2021,
+    /// Preprocessing only (-P): stray Unicode is passed through rather than
+    /// diagnosed, as by dxc.
+    preprocess_only: bool = false,
 };
 
 const Builtin = enum {
@@ -191,8 +195,13 @@ pub const Preprocessor = struct {
     fn enterFileFrom(pp: *Preprocessor, id: source.FileId, included_from: Loc) !void {
         pp.sm.setIncludedFrom(id, included_from);
         const f = pp.sm.file(id);
+        var lex: lexer.Lexer = .init(f.text, id);
+        const sink = try pp.arena.create(lexer.Lexer.Sink);
+        sink.* = .{ .diags = pp.diags, .passthrough = pp.opts.preprocess_only };
+        lex.sink = sink;
+        lex.names = pp.arena;
         try pp.includes.append(pp.arena, .{
-            .lex = .init(f.text, id),
+            .lex = lex,
             // The predefines pseudo-file has no directory to search.
             .dir = if (std.mem.eql(u8, f.path, "<built-in>")) "" else std.fs.path.dirname(f.path) orelse ".",
             .cond_base = pp.conds.items.len,
@@ -612,12 +621,18 @@ pub const Preprocessor = struct {
         if (rhs.kind == .invalid and rhs.text.len == 0) return lhs;
         const text = try std.mem.concat(pp.arena, u8, &.{ lhs.text, rhs.text });
         var l = lexer.Lexer.init(text, lhs.loc.file);
+        // A pasted universal character name is spelled in UTF-8 like a
+        // lexed one, so `\ ## u03b1` names the macro `α`.
+        l.names = pp.arena;
         const t = l.next();
-        var result: Token = .{ .kind = t.kind, .flags = lhs.flags, .text = text, .loc = lhs.loc };
+        var result: Token = .{ .kind = t.kind, .flags = lhs.flags, .text = t.text, .loc = lhs.loc };
         result.flags.no_expand = false;
-        if (t.text.len != text.len) {
+        result.flags.ucn = false; // its spelling is not lhs's
+
+        if (t.sourceLen() != text.len) {
             pp.diags.err(lhs.loc, "pasting formed '{s}', an invalid preprocessing token", .{text});
             result.kind = .invalid;
+            result.text = text;
         }
         return result;
     }
@@ -632,6 +647,11 @@ pub const Preprocessor = struct {
                     if (c == '"' or c == '\\') try buf.append(pp.arena, '\\');
                     try buf.append(pp.arena, c);
                 }
+            } else if (t.flags.ucn) {
+                // As written (`\u03b1`, not `α`), at the spelling location:
+                // an argument's token may carry an expansion location.
+                const sp = pp.sm.spellingLoc(t.loc);
+                try buf.appendSlice(pp.arena, pp.sm.file(sp.file).text[sp.offset..][0..t.ucn_len]);
             } else try buf.appendSlice(pp.arena, t.text);
         }
         try buf.append(pp.arena, '"');
@@ -685,17 +705,14 @@ pub const Preprocessor = struct {
     // ---------------------------------------------------------------------
     // Directives
 
-    /// Raw tokens up to the end of the directive line, from the current file.
+    /// Raw tokens up to the end of the directive line, from the current
+    /// file; consumes the line's `.eod`.
     fn directiveTokens(pp: *Preprocessor) Error![]Token {
         const lx = pp.currentLexer().?;
         var out: std.ArrayList(Token) = .empty;
         while (true) {
-            const saved = lx.*;
             const t = lx.next();
-            if (t.kind == .eof or t.flags.bol) {
-                lx.* = saved;
-                break;
-            }
+            if (t.kind == .eod) break;
             try out.append(pp.arena, t);
         }
         return out.items;
@@ -706,15 +723,22 @@ pub const Preprocessor = struct {
     }
 
     /// Handle a directive whose `#` has been read. Returns a token for
-    /// `#pragma` lines that are passed through.
+    /// `#pragma` lines that are passed through. Every path consumes the
+    /// directive's line, through its `.eod` (or with `restOfLine`).
     fn handleDirective(pp: *Preprocessor, hash: Token) Error!?Token {
+        // (An #include pushes the included file above this one, which may
+        // move the frames. A directive that fails may stop mid-line.)
+        const depth = pp.includes.items.len;
+        const pragma = try pp.directiveBody(hash);
+        std.debug.assert(!pp.includes.items[depth - 1].lex.in_directive);
+        return pragma;
+    }
+
+    fn directiveBody(pp: *Preprocessor, hash: Token) Error!?Token {
         const lx = pp.currentLexer().?;
-        const saved = lx.*;
+        lx.beginDirective();
         const name = lx.next();
-        if (name.kind == .eof or name.flags.bol) {
-            lx.* = saved; // null directive
-            return null;
-        }
+        if (name.kind == .eod) return null; // null directive
         if (name.kind == .number) {
             // GNU line marker: `# <line> ["file" [flags...]]`.
             const rest = try pp.directiveTokens();
@@ -793,6 +817,12 @@ pub const Preprocessor = struct {
     /// #else (when nothing was taken), or the matching #endif.
     fn skipGroup(pp: *Preprocessor) Error!void {
         const lx = pp.currentLexer().?;
+        // Skipped text is not diagnosed.
+        const sink = lx.sink;
+        if (sink) |s| s.quiet = true;
+        defer if (sink) |s| {
+            s.quiet = false;
+        };
         var depth: u32 = 0;
         while (true) {
             const t = lx.next();
@@ -805,10 +835,11 @@ pub const Preprocessor = struct {
                 lx.skipLine();
                 continue;
             }
-            const saved = lx.*;
+            lx.beginDirective();
             const d = lx.next();
-            if (d.flags.bol or d.kind != .identifier) {
-                lx.* = saved;
+            if (d.kind == .eod) continue; // null directive
+            if (d.kind != .identifier) {
+                lx.skipLine();
                 continue;
             }
             const name = d.text;
@@ -847,7 +878,15 @@ pub const Preprocessor = struct {
                     lx.skipLine();
                     continue;
                 }
-                if (try pp.evalCondition(d)) {
+                // (The condition is lexed as live text.)
+                const taken = taken: {
+                    if (sink) |s| s.quiet = false;
+                    defer if (sink) |s| {
+                        s.quiet = true;
+                    };
+                    break :taken try pp.evalCondition(d);
+                };
+                if (taken) {
                     c.taken = true;
                     return;
                 }
@@ -940,7 +979,7 @@ pub const Preprocessor = struct {
         for (body) |*t| t.flags.bol = false;
         m.body = body;
         if (pp.macros.get(name.text)) |old| {
-            const len: u32 = @intCast(name.text.len);
+            const len = name.sourceLen();
             if (old.builtin != .none) {
                 _ = pp.diags.report(.{ .severity = .warning, .loc = name.loc, .len = len, .group = "builtin-macro-redefined" }, "redefining builtin macro", .{});
             } else if (!old.sameDefinition(m)) {
@@ -970,7 +1009,7 @@ pub const Preprocessor = struct {
             const toks = try pp.expandIsolated(raw);
             if (raw.len > 0) {
                 name_loc = raw[0].loc;
-                name_len = @intCast(raw[0].text.len);
+                name_len = raw[0].sourceLen();
             }
             if (toks.len >= 1 and toks[0].kind == .string and toks[0].text.len >= 2) {
                 spelled = toks[0].text[1 .. toks[0].text.len - 1];
@@ -1004,7 +1043,7 @@ pub const Preprocessor = struct {
         };
         // Multiple-include optimization: a guarded file whose guard macro is
         // defined would contribute nothing, so do not even enter it.
-        if (includeGuard(pp.sm.file(id).content)) |guard| {
+        if (includeGuard(pp.sm.allocator(), pp.sm.file(id).content)) |guard| {
             if (pp.macros.contains(guard)) return;
         }
         if (pp.pragma_once.contains(try pp.fileKey(pp.sm.file(id).path))) return;
@@ -1048,17 +1087,23 @@ pub const Preprocessor = struct {
 
     /// The macro guarding `content`, if the whole file is wrapped in
     /// `#ifndef X` / `#if !defined(X)` ... `#endif` with no `#else`/`#elif`
-    /// at the top level and nothing outside. Computed once per content.
-    fn includeGuard(content: *source.Content) ?[]const u8 {
+    /// at the top level and nothing outside. Computed once per content; a
+    /// name with universal character names is spelled in UTF-8, as macro
+    /// names are, in memory from `gpa` (which must outlive `content`). Out
+    /// of memory finds no guard.
+    fn includeGuard(gpa: Allocator, content: *source.Content) ?[]const u8 {
         switch (content.guard) {
             .none => return null,
             .macro => |m| return m,
             .unknown => {},
         }
         content.guard = .none;
+        // (Lexed raw, keeping source spellings: only the guard's own is
+        // converted.)
         var lx = lexer.Lexer.init(content.text, 0);
         const hash = lx.next();
         if (hash.kind != .hash) return null;
+        lx.beginDirective();
         const d = lx.next();
         var name: ?Token = null;
         if (d.isIdent("ifndef")) {
@@ -1084,13 +1129,9 @@ pub const Preprocessor = struct {
                 lx.skipLine();
                 continue;
             }
+            lx.beginDirective();
             const dir = lx.next();
-            if (dir.flags.bol) {
-                // Null directive: `dir` starts the next line; re-examine it.
-                lx.pos = dir.loc.offset;
-                lx.at_bol = true;
-                continue;
-            }
+            if (dir.kind == .eod) continue; // null directive
             if (dir.isIdent("if") or dir.isIdent("ifdef") or dir.isIdent("ifndef")) {
                 depth += 1;
             } else if (dir.isIdent("endif")) {
@@ -1098,8 +1139,12 @@ pub const Preprocessor = struct {
                 if (depth == 0) {
                     lx.skipLine();
                     if (lx.next().kind != .eof) return null;
-                    content.guard = .{ .macro = macro.text };
-                    return macro.text;
+                    const guard = if (std.mem.indexOfScalar(u8, macro.text, '\\') == null)
+                        macro.text
+                    else
+                        unicode.ucnsToUtf8(gpa, macro.text) catch return null;
+                    content.guard = .{ .macro = guard };
+                    return guard;
                 }
             } else if (depth == 1 and (dir.isIdent("else") or dir.isIdent("elif"))) {
                 return null;
@@ -1601,7 +1646,7 @@ test "include guards are detected and guarded files are not re-entered" {
     const sm = &t.sm;
     var guards: [4]?[]const u8 = undefined;
     for ([_][]const u8{ "./g.h", "./d.h", "./e.h", "./o.h" }, 0..) |path, i| {
-        guards[i] = Preprocessor.includeGuard(sm.cache.get(path).?.?);
+        guards[i] = Preprocessor.includeGuard(sm.allocator(), sm.cache.get(path).?.?);
     }
     try std.testing.expectEqualStrings("G_H", guards[0].?);
     try std.testing.expectEqualStrings("D_H", guards[1].?);
@@ -1647,4 +1692,66 @@ test "deep nesting is diagnosed instead of overflowing the stack" {
     defer t.deinit();
     _ = try t.output();
     try std.testing.expectEqual(@as(u32, 2), t.diags.error_count);
+}
+
+fn expectUnicode(main: []const u8, expected: []const u8, messages: []const []const u8) !void {
+    try expectUnicodeOpts(main, .{}, expected, messages);
+}
+
+fn expectUnicodeOpts(main: []const u8, opts: Options, expected: []const u8, messages: []const []const u8) !void {
+    var t: TestPP = .{};
+    try t.init(&.{}, main, opts);
+    defer t.deinit();
+    try std.testing.expectEqualStrings(expected, try t.output());
+    try std.testing.expectEqual(messages.len, t.diags.list.items.len);
+    for (messages, t.diags.list.items) |m, d| try std.testing.expectEqualStrings(m, d.message);
+}
+
+test "Unicode identifiers and stray Unicode" {
+    const non_ascii = "non-ASCII characters are not allowed outside of literals and identifiers";
+    const space = "treating Unicode character as whitespace";
+    // Universal character names are spelled as UTF-8, in macro names too.
+    try expectUnicode("#define \\u03a9 2\nx\\u03b1 \\U000003B1 \u{3A9}", "xα α 2", &.{});
+    try expectUnicode("#define C(a, b) a##b\nC(x, α)", "xα", &.{});
+    // Pasting one spells it in UTF-8 too; `#` keeps it as written.
+    try expectUnicode("#define C(a, b) a##b\n#define \\u03b1 1\nC(\\, u03b1)", "1", &.{});
+    try expectUnicode("#define S(a) #a\nS(x\\u03b1 \u{3B2})", "\"x\\u03b1 \u{3B2}\"", &.{});
+    // Outside directives, characters that cannot start a token are dropped.
+    try expectUnicode("x\u{1F600}y \u{301}z", "x y z", &.{ non_ascii, non_ascii });
+    try expectUnicode("a\xffb", "a b", &.{"source file is not valid UTF-8"});
+    // Unicode whitespace separates tokens; each is diagnosed once, though
+    // the directive is lexed more than once.
+    try expectUnicode("a\u{3000}b\\u3000c", "a b c", &.{ space, space });
+    try expectUnicode("#define A 1\u{3000}\nA", "1", &.{space});
+    // In a directive the character stays a token.
+    try expectUnicode("#define A 1\u{1F600}\nA", "1 \u{1F600}", &.{});
+    // Skipped groups are not diagnosed, nor is what follows a directive
+    // diagnosed while the preprocessor looks ahead.
+    try expectUnicode("#if 0\n\u{1F600}\u{3000}\n#endif\nx", "x", &.{});
+    try expectUnicode("#if 0\n#elif 1\u{3000}\n\u{1F600}y\n#endif", "y", &.{ space, non_ascii });
+    // Universal character names that are not.
+    try expectUnicode("x\\u03b", "x \\ u03b", &.{"incomplete universal character name; treating as '\\' followed by identifier"});
+    try expectUnicode("x\\uxyz", "x \\ uxyz", &.{"\\u used with no following hex digits; treating as '\\' followed by identifier"});
+    try expectUnicode("x\\u0041", "x \\ u0041", &.{"character 'A' cannot be specified by a universal character name"});
+    try expectUnicode("\\ud800", "\\ ud800", &.{"universal character name refers to a surrogate character"});
+}
+
+test "an include guard with universal character names is spelled in UTF-8" {
+    var t: TestPP = .{};
+    try t.init(&.{
+        .{ "./u.h", "#ifndef \\u03b1_H\n#define \\u03b1_H\nint u;\n#endif\n" },
+    }, "#include \"u.h\"\n#include \"u.h\"\n", .{});
+    defer t.deinit();
+    try std.testing.expectEqualStrings("int u ;", try t.output());
+    const guard = Preprocessor.includeGuard(t.sm.allocator(), t.sm.cache.get("./u.h").?.?);
+    try std.testing.expectEqualStrings("\u{3B1}_H", guard.?);
+}
+
+test "preprocessed output diagnoses bad universal character names, not stray Unicode" {
+    try expectUnicodeOpts(
+        "a\u{3000}b\u{1F600}c x\\u0041",
+        .{ .preprocess_only = true },
+        "a \u{3000} b \u{1F600} c x \\ u0041",
+        &.{"character 'A' cannot be specified by a universal character name"},
+    );
 }

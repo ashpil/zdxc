@@ -6,6 +6,7 @@ const std = @import("std");
 const BumpArena = @import("BumpArena.zig");
 const Allocator = std.mem.Allocator;
 const source = @import("front/source.zig");
+const unicode = @import("front/unicode.zig");
 const Loc = source.Loc;
 
 pub const Severity = enum {
@@ -345,23 +346,43 @@ const Renderer = struct {
         const line = r.sm.lineText(loc);
         const col = r.sm.lineCol(loc).col;
         try w.print("{s}\n", .{line});
+        // (The column is in bytes, as clang's; the caret is placed by
+        // display width.)
         const caret_at = col - 1;
-        // Indentation keeps tabs so the caret lines up with the source.
-        for (0..caret_at) |i| try w.writeByte(if (i < line.len and line[i] == '\t') '\t' else ' ');
+        try indent(w, line, caret_at);
         try r.color("\x1b[1;32m");
         try w.writeByte('^');
-        if (len > 1) {
+        if (caret_at < line.len) {
             const end = @min(caret_at + len, line.len);
-            if (end > caret_at + 1) try w.splatByteAll('~', end - caret_at - 1);
+            const width = unicode.displayWidth(line[caret_at..end]);
+            if (width > 1) try w.splatByteAll('~', width - 1);
         }
         try r.color(reset);
         try w.writeByte('\n');
         if (fixit) |text| {
-            for (0..caret_at) |i| try w.writeByte(if (i < line.len and line[i] == '\t') '\t' else ' ');
+            try indent(w, line, caret_at);
             try r.color("\x1b[0;32m");
             try w.writeAll(text);
             try r.color(reset);
             try w.writeByte('\n');
+        }
+    }
+
+    /// Blanks as wide as `line[0..to]` (`to` may be past its end), keeping
+    /// tabs so the caret lines up with the source.
+    fn indent(w: *std.Io.Writer, line: []const u8, to: usize) !void {
+        var i: usize = 0;
+        while (i < to) {
+            if (i >= line.len or line[i] < 0x80) {
+                try w.writeByte(if (i < line.len and line[i] == '\t') '\t' else ' ');
+                i += 1;
+            } else if (unicode.decodeUtf8(line, i)) |d| {
+                try w.splatByteAll(' ', unicode.columnWidth(d.cp));
+                i += d.len;
+            } else {
+                try w.writeByte(' ');
+                i += 1;
+            }
         }
     }
 };
@@ -402,6 +423,33 @@ test "rendering: ranges, notes, fix-its, groups, formats" {
         \\a.hlsl(2,2): warning: suspicious [-Wdemo]
         \\
     , out2.written());
+}
+
+test "rendering: carets line up after non-ASCII text" {
+    const gpa = std.testing.allocator;
+    var mfs: source.MemoryFs = .{};
+    var sm = source.SourceManager.init(gpa, mfs.fileSystem());
+    defer sm.deinit();
+    // α is 2 bytes and 1 column; 速度 is 6 bytes and 4 columns.
+    const f = try sm.addFile("a.hlsl", "int αβγ\n速度 z;\n");
+    var d = Diagnostics.init(gpa);
+    defer d.deinit();
+    _ = d.report(.{ .severity = .@"error", .loc = .{ .file = f, .offset = 10 }, .fixit = ";" }, "expected ';'", .{});
+    _ = d.report(.{ .severity = .@"error", .loc = .{ .file = f, .offset = 11 }, .len = 6 }, "unknown type name", .{});
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try d.render(&sm, &out.writer, .{});
+    try std.testing.expectEqualStrings(
+        \\a.hlsl:1:11: error: expected ';'
+        \\int αβγ
+        \\       ^
+        \\       ;
+        \\a.hlsl:2:1: error: unknown type name
+        \\速度 z;
+        \\^~~~
+        \\
+    , out.written());
 }
 
 test "warning policy and error limit" {
