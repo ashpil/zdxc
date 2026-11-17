@@ -1589,12 +1589,77 @@ pub const Sema = struct {
         };
     }
 
-    /// A constant variable's initializer, in its declaring scope.
+    /// A constant variable's initializer, in its declaring scope, as a
+    /// value of the variable's type.
     fn evalVarConst(s: *Sema, v: *const Variable) ?Const {
         const saved = s.scope;
         defer s.scope = saved;
         if (v.init_scope) |sc| s.scope = sc;
-        return s.evalConst(v.init orelse return null);
+        const c = s.evalConst(v.init orelse return null) orelse return null;
+        return s.convertConst(v.type, c);
+    }
+
+    /// `c` converted to scalar (or enum) type `ty`, as an implicit
+    /// conversion or a cast does: an integer wraps to the type's width, a
+    /// float truncates to an integer. Other types leave it as it is.
+    fn convertConst(s: *Sema, ty: TypeId, c: Const) Const {
+        if (ty == TypeTable.error_type) return c;
+        const sc: Scalar = switch (s.types.get(ty)) {
+            .scalar => |x| x,
+            .@"enum" => |en| en.underlying,
+            else => return c,
+        };
+        if (sc == .bool) return .{ .bool = truthy(c) };
+        if (sc.isFloat()) return switch (c) {
+            .int => |v| .{ .float = @floatFromInt(v) },
+            .bool => |b| .{ .float = @floatFromInt(@intFromBool(b)) },
+            .float => c,
+        };
+        if (!sc.isInt()) return c;
+        return .{ .int = wrapInt(sc, switch (c) {
+            .int => |v| v,
+            .bool => |b| @intFromBool(b),
+            .float => |f| if (std.math.isFinite(f) and @abs(f) < 0x1p63) @as(i64, @intFromFloat(@trunc(f))) else return c,
+        }) };
+    }
+
+    /// The integer type of a constant expression, if it has one that is
+    /// known: the type Sema gave it, or for what Sema has not checked (a
+    /// template argument) the type its literals give it. A bool counts as
+    /// an int, as it is promoted to one.
+    fn constIntType(s: *Sema, e: *const ast.Expr) ?Scalar {
+        if (e.ty != TypeTable.error_type) {
+            const sc: Scalar = switch (s.types.get(e.ty)) {
+                .scalar => |x| x,
+                .@"enum" => |en| en.underlying,
+                else => return null,
+            };
+            return if (sc == .bool) .int else if (sc.isInt()) sc else null;
+        }
+        return switch (e.kind) {
+            .int_lit => |t| intLiteralType(t),
+            .bool_lit => .int,
+            .unary => |u| if (u.op == .not) .int else s.constIntType(u.operand),
+            .binary => |b| switch (b.op) {
+                .add, .sub, .mul, .div, .rem, .bit_and, .bit_or, .bit_xor => commonInt(s.constIntType(b.lhs), s.constIntType(b.rhs)),
+                .shl, .shr => s.constIntType(b.lhs),
+                .lt, .gt, .le, .ge, .eq, .ne, .log_and, .log_or => .int,
+                else => null,
+            },
+            else => null,
+        };
+    }
+
+    /// A binary operation on constants: integer operands are converted to
+    /// their common type first, and the result has that type's width, so
+    /// `0xFFFFFFFFu + 1` is 0 and `-1 < 0u` is false, as when lowered.
+    fn foldBinary(s: *Sema, op: ast.BinaryOp, lhs: *const ast.Expr, rhs: *const ast.Expr, l: Const, r: Const) ?Const {
+        if (l == .float or r == .float) return evalBinary(op, l, r, null);
+        const lt = s.constIntType(lhs);
+        return evalBinary(op, l, r, switch (op) {
+            .shl, .shr => lt,
+            else => commonInt(lt, s.constIntType(rhs)),
+        });
     }
 
     pub fn evalVarInt(s: *Sema, v: *const Variable) ?i64 {
@@ -1664,16 +1729,18 @@ pub const Sema = struct {
             },
             .unary => |u| blk: {
                 const v = s.evalConst(u.operand) orelse break :blk null;
+                // (The result wraps to the operand's width: `~0u` is 0xFFFFFFFF.)
+                const ty = s.constIntType(e) orelse .literal_int;
                 break :blk switch (u.op) {
                     .plus => v,
                     .minus => switch (v) {
-                        .int => |x| .{ .int = -%x },
+                        .int => |x| .{ .int = wrapInt(ty, -%x) },
                         .float => |x| .{ .float = -x },
-                        .bool => |b| .{ .int = -@as(i64, @intFromBool(b)) },
+                        .bool => |b| .{ .int = wrapInt(ty, -@as(i64, @intFromBool(b))) },
                     },
                     .not => .{ .bool = !truthy(v) },
                     .bit_not => switch (v) {
-                        .int => |x| .{ .int = ~x },
+                        .int => |x| .{ .int = wrapInt(ty, ~x) },
                         else => null,
                     },
                     else => null,
@@ -1682,14 +1749,14 @@ pub const Sema = struct {
             .binary => |b| blk: {
                 const l = s.evalConst(b.lhs) orelse break :blk null;
                 const r = s.evalConst(b.rhs) orelse break :blk null;
-                break :blk evalBinary(b.op, l, r);
+                break :blk s.foldBinary(b.op, b.lhs, b.rhs, l, r);
             },
             .conditional => |c| blk: {
                 const cond = s.evalConst(c.cond) orelse break :blk null;
                 break :blk if (truthy(cond)) s.evalConst(c.then) else s.evalConst(c.@"else");
             },
-            .cast => |c| s.evalConst(c.operand),
-            .construct => |c| if (c.args.len == 1) s.evalConst(c.args[0]) else null,
+            .cast => |c| if (s.evalConst(c.operand)) |v| s.convertConst(e.ty, v) else null,
+            .construct => |c| if (c.args.len != 1) null else if (s.evalConst(c.args[0])) |v| s.convertConst(e.ty, v) else null,
             // Sizes are kept by Sema (plus one; zero: unknown).
             // (Fresh for types: template arguments are shared by instances.)
             .sizeof_type => |t| blk: {
@@ -4125,7 +4192,41 @@ fn truthy(v: Sema.Const) bool {
     };
 }
 
-fn evalBinary(op: ast.BinaryOp, l: Sema.Const, r: Sema.Const) ?Sema.Const {
+/// `v` as a value of integer type `sc`: wrapped to its width, sign- or
+/// zero-extended. (Minimum-precision integers are computed in 32 bits.)
+fn wrapInt(sc: Scalar, v: i64) i64 {
+    const u: u64 = @bitCast(v);
+    return switch (sc) {
+        .int, .min16int, .min12int => @as(i32, @bitCast(@as(u32, @truncate(u)))),
+        .uint, .min16uint, .int8_4packed, .uint8_4packed => @as(u32, @truncate(u)),
+        .int16 => @as(i16, @bitCast(@as(u16, @truncate(u)))),
+        .uint16 => @as(u16, @truncate(u)),
+        else => v,
+    };
+}
+
+fn intBits(sc: Scalar) u8 {
+    return switch (sc) {
+        .int64, .uint64, .literal_int => 64,
+        .int16, .uint16 => 16,
+        else => 32,
+    };
+}
+
+/// The type two integer operands are converted to: a literal takes the
+/// other's type, the wider type wins, and of two as wide the unsigned one.
+fn commonInt(a: ?Scalar, b: ?Scalar) ?Scalar {
+    const x = a orelse return null;
+    const y = b orelse return null;
+    if (x == .literal_int) return y;
+    if (y == .literal_int) return x;
+    if (intBits(x) != intBits(y)) return if (intBits(x) > intBits(y)) x else y;
+    return if (y.isUnsigned()) y else x;
+}
+
+/// `ty`: the integer type the operands are converted to and the result
+/// has (for a shift, the left operand's); null computes in 64 bits.
+fn evalBinary(op: ast.BinaryOp, l: Sema.Const, r: Sema.Const, ty: ?Scalar) ?Sema.Const {
     if (op == .log_and) return .{ .bool = truthy(l) and truthy(r) };
     if (op == .log_or) return .{ .bool = truthy(l) or truthy(r) };
     const is_float = l == .float or r == .float;
@@ -4154,35 +4255,45 @@ fn evalBinary(op: ast.BinaryOp, l: Sema.Const, r: Sema.Const) ?Sema.Const {
             else => null,
         };
     }
-    const a: i64 = switch (l) {
+    const sc = ty orelse .literal_int;
+    const shift = op == .shl or op == .shr;
+    const a: i64 = wrapInt(sc, switch (l) {
         .int => |x| x,
         .bool => |b| @intFromBool(b),
         .float => unreachable,
-    };
-    const b: i64 = switch (r) {
+    });
+    const rv: i64 = switch (r) {
         .int => |x| x,
         .bool => |x| @intFromBool(x),
         .float => unreachable,
     };
-    return switch (op) {
-        .add => .{ .int = a +% b },
-        .sub => .{ .int = a -% b },
-        .mul => .{ .int = a *% b },
-        .div => if (b == 0) null else .{ .int = @divTrunc(a, b) },
-        .rem => if (b == 0) null else .{ .int = @rem(a, b) },
-        .shl => .{ .int = if (b < 0 or b >= 64) 0 else a << @intCast(b) },
-        .shr => .{ .int = if (b < 0 or b >= 64) 0 else a >> @intCast(b) },
-        .bit_and => .{ .int = a & b },
-        .bit_or => .{ .int = a | b },
-        .bit_xor => .{ .int = a ^ b },
-        .lt => .{ .bool = a < b },
-        .gt => .{ .bool = a > b },
-        .le => .{ .bool = a <= b },
-        .ge => .{ .bool = a >= b },
-        .eq => .{ .bool = a == b },
-        .ne => .{ .bool = a != b },
-        else => null,
+    // (A shift count keeps its own type.)
+    const b: i64 = if (shift) rv else wrapInt(sc, rv);
+    // 32-bit and narrower values are extended by their sign, so 64-bit
+    // signed arithmetic is theirs; only uint64 needs unsigned operations.
+    const ua: u64 = @bitCast(a);
+    const ub: u64 = @bitCast(b);
+    const unsigned64 = sc == .uint64;
+    const v: i64 = switch (op) {
+        .add => a +% b,
+        .sub => a -% b,
+        .mul => a *% b,
+        .div => if (b == 0) return null else if (unsigned64) @bitCast(ua / ub) else if (b == -1) -%a else @divTrunc(a, b),
+        .rem => if (b == 0) return null else if (unsigned64) @bitCast(ua % ub) else if (b == -1) 0 else @rem(a, b),
+        .shl => if (b < 0 or b >= 64) 0 else a << @intCast(b),
+        .shr => if (b < 0 or b >= 64) 0 else if (unsigned64) @bitCast(ua >> @intCast(b)) else a >> @intCast(b),
+        .bit_and => a & b,
+        .bit_or => a | b,
+        .bit_xor => a ^ b,
+        .lt => return .{ .bool = if (unsigned64) ua < ub else a < b },
+        .gt => return .{ .bool = if (unsigned64) ua > ub else a > b },
+        .le => return .{ .bool = if (unsigned64) ua <= ub else a <= b },
+        .ge => return .{ .bool = if (unsigned64) ua >= ub else a >= b },
+        .eq => return .{ .bool = a == b },
+        .ne => return .{ .bool = a != b },
+        else => return null,
     };
+    return .{ .int = wrapInt(sc, v) };
 }
 
 pub fn parseIntLiteral(text: []const u8) ?i64 {
@@ -4247,7 +4358,7 @@ fn intLiteralType(text: []const u8) Scalar {
     while (i > 0) : (i -= 1) {
         switch (text[i - 1]) {
             'u', 'U' => unsigned = true,
-            'l', 'L' => longs += 1,
+            'l', 'L' => longs +|= 1,
             else => break,
         }
     }
@@ -4684,6 +4795,57 @@ test "literal suffixes" {
         \\_Static_assert(std::is_same<half, float16_t>::value, "");
         \\_Static_assert(std::is_same<float16_t, __decltype(1.5h)>::value, "");
     , .{ .enable_16bit = true }, &.{});
+}
+
+test "constants fold in their type's width and signedness" {
+    // Operands convert to their common type and the result wraps to it,
+    // as dxc folds them (and as lowering computes them).
+    try expectDiags(
+        \\_Static_assert('\xff' + 1 == 0, "");
+        \\_Static_assert(4294967295l == 0xFFFFFFFFu, "");
+        \\_Static_assert(0xFFFFFFFFu + 1 == 0 && 0xFFFFFFFFu * 0xFFFFFFFFu == 1, "");
+        \\_Static_assert(~0u == 0xFFFFFFFF && (uint)-1 == 4294967295, "");
+        \\_Static_assert(!(-1 < 0u) && !(-1 < 0ull) && 1u - 2 > 0, "");
+        \\_Static_assert(2147483647 + 1 > 0, "");
+        \\_Static_assert((int)0xFFFFFFFF == -1 && (int)2.7 == 2 && (bool)5 == true, "");
+        \\_Static_assert(0x80000000u >> 31 == 1 && (int)0x80000000 >> 31 == -1, "");
+        \\_Static_assert((1u << 31) << 1 == 0, "");
+        \\_Static_assert(0xFFFFFFFFFFFFFFFFull / 2 == 0x7FFFFFFFFFFFFFFFull, "");
+        \\_Static_assert(-1 / 2u == 0x7FFFFFFF && -2147483648ll / -1 == 2147483648ll, "");
+        \\_Static_assert((float)1 / 2 == 0.5, "");
+        \\static const uint a = -1;
+        \\static const int b = 0xFFFFFFFF;
+        \\_Static_assert(a == 0xFFFFFFFF && b == -1, "");
+        \\static float c['\xff' + 2];
+        \\_Static_assert(sizeof(c) == 4, "");
+    , .{}, &.{});
+    // A suffix of any length is a diagnostic, in an array bound too.
+    const ls: [300]u8 = @splat('L');
+    try expectDiags("static float a[1" ++ &ls ++ "];", .{}, &.{
+        "1: error: invalid suffix '" ++ &ls ++ "' on integer constant",
+    });
+}
+
+test "universal character names in character constants" {
+    try expectDiags(
+        \\static const int a = '\u';
+        \\static const int b = '\u03b';
+        \\static const int c = '\u03b1';
+        \\static const int d = '\U000003B1';
+        \\static const int e = '\u0041';
+        \\static const int f = '\ud800';
+        \\static const int g = '\u0001';
+        \\static const int h = '\u0024';
+        \\_Static_assert(h == 36, "");
+    , .{}, &.{
+        "1: error: \\u used with no following hex digits",
+        "2: error: incomplete universal character name",
+        "3: error: character too large for enclosing character literal type",
+        "4: error: character too large for enclosing character literal type",
+        "5: error: character 'A' cannot be specified by a universal character name",
+        "6: error: invalid universal character",
+        "7: error: universal character name refers to a control character",
+    });
 }
 
 test "declaration modifiers" {

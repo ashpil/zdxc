@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const source = @import("source.zig");
+const unicode = @import("unicode.zig");
 const Diagnostics = @import("../diag.zig").Diagnostics;
 const Loc = source.Loc;
 
@@ -192,9 +193,33 @@ pub const Char = struct {
     value: i64 = 0,
     /// Characters between the quotes: 0 for `''`.
     count: u32 = 0,
-    problem: ?struct { at: u32, kind: enum { hex_no_digits, hex_too_large, octal_too_large } } = null,
+    problem: ?Fault = null,
     /// The first escape that is none (`'\q'`): its value is the character.
     unknown_escape: ?struct { at: u32, c: u8 } = null,
+
+    pub const Fault = struct {
+        at: u32,
+        kind: Kind,
+        /// `ucn_no_digits`: `u` or `U`. `ucn_basic`: the character named.
+        c: u8 = 0,
+
+        pub const Kind = enum {
+            hex_no_digits,
+            hex_too_large,
+            octal_too_large,
+            /// `\u` or `\U` with no hex digit after it.
+            ucn_no_digits,
+            /// Fewer than four (`\u`) or eight (`\U`) hex digits.
+            ucn_incomplete,
+            /// A surrogate, or past U+10FFFF.
+            ucn_invalid,
+            ucn_control,
+            /// A character of the basic character set (`A`).
+            ucn_basic,
+            /// A universal character name that is one, but no `char`.
+            too_large,
+        };
+    };
 };
 
 /// Reads a character constant token (`'a'`, `'\n'`, `'\x41'`, `'\101'`).
@@ -248,6 +273,35 @@ pub fn parseChar(text: []const u8) Char {
                     if (v > 0xff and r.problem == null) r.problem = .{ .at = start, .kind = .octal_too_large };
                     break :octal v & 0xff;
                 },
+                'u', 'U' => ucn: {
+                    // A universal character name: all its digits, and a
+                    // character a `char` holds (only `$`, `@` and `` ` ``
+                    // are both nameable and that small).
+                    const e = unicode.scanEscape(text[0..end], start).?;
+                    i = start + e.len();
+                    const v = e.value;
+                    const kind: Char.Fault.Kind = if (e.digits == 0)
+                        .ucn_no_digits
+                    else if (!e.complete())
+                        .ucn_incomplete
+                    else if (v > 0x10FFFF or (v >= 0xD800 and v <= 0xDFFF))
+                        .ucn_invalid
+                    else if (v < 0x20 or (v >= 0x7F and v < 0xA0))
+                        .ucn_control
+                    else if (v >= 0xA0)
+                        .too_large
+                    else if (v != '$' and v != '@' and v != '`')
+                        .ucn_basic
+                    else
+                        break :ucn @intCast(v);
+                    if (r.problem == null) r.problem = .{
+                        // (clang: at the constant, not the escape.)
+                        .at = if (kind == .too_large) 0 else start,
+                        .kind = kind,
+                        .c = if (kind == .ucn_basic) @intCast(v) else esc,
+                    };
+                    break :ucn 0;
+                },
                 '\\', '\'', '"', '?', '(', '{', '[', '%' => esc,
                 else => unknown: {
                     if (r.unknown_escape == null) r.unknown_escape = .{ .at = start, .c = esc };
@@ -271,6 +325,12 @@ pub fn reportChar(diags: *Diagnostics, loc: Loc, c: Char) bool {
             .hex_no_digits => diags.err(at, "\\x used with no following hex digits", .{}),
             .hex_too_large => diags.err(at, "hex escape sequence out of range", .{}),
             .octal_too_large => diags.err(at, "octal escape sequence out of range", .{}),
+            .ucn_no_digits => diags.err(at, "\\{c} used with no following hex digits", .{p.c}),
+            .ucn_incomplete => diags.err(at, "incomplete universal character name", .{}),
+            .ucn_invalid => diags.err(at, "invalid universal character", .{}),
+            .ucn_control => diags.err(at, "universal character name refers to a control character", .{}),
+            .ucn_basic => diags.err(at, "character '{c}' cannot be specified by a universal character name", .{p.c}),
+            .too_large => diags.err(at, "character too large for enclosing character literal type", .{}),
         }
         return false;
     }
@@ -306,6 +366,22 @@ test "character constants" {
     try std.testing.expect(parseChar("'\\x'").problem.?.kind == .hex_no_digits);
     try std.testing.expect(parseChar("'\\x141'").problem.?.kind == .hex_too_large);
     try std.testing.expect(parseChar("'\\400'").problem.?.kind == .octal_too_large);
+    // Universal character names: only `$`, `@` and `` ` `` are a `char`.
+    try expectEqual(@as(i64, '$'), parseChar("'\\u0024'").value);
+    try std.testing.expect(parseChar("'\\u0024'").problem == null);
+    try expectEqual(@as(u32, 1), parseChar("'\\U00000040'").count);
+    try std.testing.expect(parseChar("'\\u'").problem.?.kind == .ucn_no_digits);
+    try expectEqual(@as(u8, 'U'), parseChar("'\\U'").problem.?.c);
+    try std.testing.expect(parseChar("'\\u03b'").problem.?.kind == .ucn_incomplete);
+    try std.testing.expect(parseChar("'\\U0000004'").problem.?.kind == .ucn_incomplete);
+    try std.testing.expect(parseChar("'\\ud800'").problem.?.kind == .ucn_invalid);
+    try std.testing.expect(parseChar("'\\U00110000'").problem.?.kind == .ucn_invalid);
+    try std.testing.expect(parseChar("'\\u0001'").problem.?.kind == .ucn_control);
+    try std.testing.expect(parseChar("'\\u0041'").problem.?.kind == .ucn_basic);
+    try expectEqual(@as(u8, 'A'), parseChar("'\\u0041'").problem.?.c);
+    try std.testing.expect(parseChar("'\\u03b1'").problem.?.kind == .too_large);
+    try expectEqual(@as(u32, 0), parseChar("'\\u03b1'").problem.?.at);
+    try expectEqual(@as(u32, 1), parseChar("'\\u03b1'").count);
     try expectEqual(@as(u8, 'q'), parseChar("'\\q'").unknown_escape.?.c);
     try expectEqual(@as(i64, 'q'), parseChar("'\\q'").value);
 }
