@@ -62,6 +62,9 @@ pub const Result = struct {
     /// The root signature container (-Frs) and its name.
     root_signature: ?[]const u8 = null,
     root_signature_name: ?[]const u8 = null,
+    /// DXIL with -Zi -Fd: the PDB and its name.
+    pdb: ?[]const u8 = null,
+    pdb_name: ?[]const u8 = null,
     /// DXIL: the shader's reflection (dxil/reflect.zig), for the DXC
     /// drop-in's DXC_OUT_REFLECTION.
     reflection: ?[]const u8 = null,
@@ -203,6 +206,14 @@ const Options = struct {
     dump_ast: bool = false,
     sema: bool = false,
     dump_ir: bool = false,
+    /// -zdxc-debug: positions and variables in the IR.
+    debug: zdxc.ir.ir.DebugLevel = .none,
+    /// -Zi, and -fspv-debug (which replaces what -Zi turns on).
+    zi: bool = false,
+    /// -Fd and -Qembed_debug (DXIL).
+    pdb_output: ?[]const u8 = null,
+    embed_debug: bool = false,
+    spv_debug: ?struct { file: bool = false, source: bool = false, line: bool = false, tool: bool = false, rich: bool = false } = null,
     /// -zdxc-no-opt: no SPIR-V IR optimizations.
     no_opt: bool = false,
     /// -O0..-O3 / -Od (default -O3, as in dxc).
@@ -237,6 +248,7 @@ fn parseArgs(ctx: *Ctx, arena: std.mem.Allocator, args: []const []const u8) !?Op
                 },
                 .zdxc_sema => opts.sema = true,
                 .zdxc_ir => opts.dump_ir = true,
+                .zdxc_debug => opts.debug = .full,
                 .zdxc_no_opt => opts.no_opt = true,
                 .zdxc_exp => zdxc.dxil.exp.cur = zdxc.dxil.exp.Exp.parse(a.value()),
                 .job => opts.job = a.value(),
@@ -335,6 +347,33 @@ fn parseArgs(ctx: *Ctx, arena: std.mem.Allocator, args: []const []const u8) !?Op
                     .fspv_entrypoint_name_EQ => opts.vk.entry_name = v,
                     .fspv_extension_EQ => try opts.vk.extensions.append(arena, v),
                     .fspv_reflect => opts.vk.reflect = true,
+                    ._SLASH_Zi => opts.zi = true,
+                    .Fd => opts.pdb_output = v,
+                    .Qembed_debug => opts.embed_debug = true,
+                    .fspv_debug_EQ => {
+                        if (opts.spv_debug == null) opts.spv_debug = .{};
+                        const d = &opts.spv_debug.?;
+                        if (std.mem.eql(u8, v, "file")) {
+                            d.file = true;
+                        } else if (std.mem.eql(u8, v, "source")) {
+                            d.file = true;
+                            d.source = true;
+                        } else if (std.mem.eql(u8, v, "line")) {
+                            d.file = true;
+                            d.source = true;
+                            d.line = true;
+                        } else if (std.mem.eql(u8, v, "tool")) {
+                            d.tool = true;
+                        } else if (std.mem.eql(u8, v, "vulkan") or std.mem.eql(u8, v, "vulkan-with-source")) {
+                            // NonSemantic.Shader.DebugInfo.100.
+                            d.file = true;
+                            d.source = v.len > 6;
+                            d.line = true;
+                            d.rich = true;
+                        } else if (std.mem.eql(u8, v, "rich") or std.mem.eql(u8, v, "rich-with-source")) {
+                            return ctx.fail("'-fspv-debug={s}' (OpenCL.DebugInfo.100) is not supported by zdxc; use -fspv-debug=vulkan-with-source", .{v});
+                        } else return ctx.fail("unknown SPIR-V debug info control parameter: {s}", .{v});
+                    },
                     .fspv_enable_maximal_reconvergence => opts.vk.maximal_reconvergence = true,
                     .fvk_support_nonzero_base_instance => opts.vk.nonzero_base_instance = true,
                     .fvk_support_nonzero_base_vertex => opts.vk.nonzero_base_vertex = true,
@@ -388,6 +427,17 @@ fn parseArgs(ctx: *Ctx, arena: std.mem.Allocator, args: []const []const u8) !?Op
     }
     // (Epic's DXC runs its fused multiply-add pass only when optimizing.)
     if (opts.opt_level == .od or opts.opt_level == .o0) opts.vk.fuse_mul_add = false;
+    if (opts.spv_debug != null and !opts.spirv) return ctx.fail("-fspv-debug needs -spirv", .{});
+    if ((opts.pdb_output != null or opts.embed_debug) and (!opts.zi or opts.spirv)) return ctx.fail("-Fd and -Qembed_debug need -Zi and a DXIL target", .{});
+    if (opts.zi) {
+        if (opts.spirv) {
+            // (As dxc: every category, unless -fspv-debug picks.)
+            if (opts.spv_debug == null) opts.spv_debug = .{ .file = true, .source = true, .line = true, .tool = true };
+        } else opts.debug = .full;
+    }
+    if (opts.spv_debug) |d| if (d.line) {
+        opts.debug = .full;
+    };
     if (opts.row_major and opts.col_major) return ctx.fail("Cannot specify /Zpr and /Zpc together, use /? to get usage information", .{});
     // Like dxc, the last input wins (dxc reads getLastArgValue(OPT_INPUT)).
     if (parsed.inputs.len > 0) opts.input = parsed.inputs[parsed.inputs.len - 1] else if (ctx.req.main_input) |m| opts.input = m;
@@ -522,7 +572,7 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
                             else => .library,
                         };
                         const zl = stats.begin(.lower);
-                        module = zdxc.ir.lower.lowerUnit(arena, &sema, .{ .entry = opts.entry, .stage = stage }) catch |e| switch (e) {
+                        module = zdxc.ir.lower.lowerUnit(arena, &sema, .{ .entry = opts.entry, .stage = stage, .debug = opts.debug }) catch |e| switch (e) {
                             error.Unsupported => null,
                             else => |x| return x,
                         };
@@ -577,11 +627,22 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
                 zdxc.ir.ir.verify(m);
             }
             if (opts.dump_ir) {
-                try zdxc.ir.ir.dump(m, ctx.stdout);
+                try zdxc.ir.ir.dumpWith(m, ctx.stdout, if (m.debug != .none) &sm else null);
                 return;
             }
             if (opts.spirv) {
-                const bytes = zdxc.spirv.emit.emit(arena, m, &diags, zdxc.spirv.emit.TargetEnv.parse(opts.target_env) orelse return ctx.fail("unknown SPIR-V target environment '{s}'", .{opts.target_env})) catch |err| switch (err) {
+                const dbg: ?zdxc.spirv.emit.Debug = if (opts.spv_debug) |d| .{
+                    .sm = &sm,
+                    .main_file = pp.main_file.?,
+                    .file = d.file,
+                    .text = d.source,
+                    .line = d.line,
+                    .processed = if (d.tool) &.{"zdxc-version: " ++ zdxc.version} else &.{},
+                    .rich = d.rich,
+                    .signature = "zdxc " ++ zdxc.version,
+                    .args = if (d.rich) try std.mem.join(arena, " ", ctx.req.args) else "",
+                } else null;
+                const bytes = zdxc.spirv.emit.emitDebug(arena, m, &diags, zdxc.spirv.emit.TargetEnv.parse(opts.target_env) orelse return ctx.fail("unknown SPIR-V target environment '{s}'", .{opts.target_env}), dbg) catch |err| switch (err) {
                     error.Unsupported => {
                         try diags.render(&sm, ctx.stderr, .{ .format = opts.diag_format, .color = false, .unplaced = if (ctx.req.place_unplaced) opts.input else null });
                         return error.CompileFailed;
@@ -603,7 +664,18 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
                 if (en.stage == .compute and en.wave_size[0] == 0) en.wave_size = .{ zdxc.dxil.exp.cur.wave, 0, 0 };
             };
             const zd = stats.begin(.dxil);
-            const dxil_out = zdxc.dxil.emit.emitWithReflectionAt(arena, m, profile.?, &diags, if (opts.no_opt) .none else if (opts.opt_level == .od) .debug else .full) catch |err| switch (err) {
+            // -Zi: the debug module goes into the PDB (-Fd) or, with
+            // -Qembed_debug or no -Fd, into the container (as dxc).
+            const dxil_dbg: ?zdxc.dxil.emit.Debug = if (opts.zi) .{
+                .sm = &sm,
+                .main_file = pp.main_file.?,
+                .args = ctx.req.args,
+                .producer = "zdxc " ++ zdxc.version,
+                .embed = opts.embed_debug or opts.pdb_output == null,
+                .pdb = opts.pdb_output != null,
+                .pdb_name = opts.pdb_output,
+            } else null;
+            const dxil_out = zdxc.dxil.emit.emitDebug(arena, m, profile.?, &diags, if (opts.no_opt) .none else if (opts.opt_level == .od) .debug else .full, dxil_dbg) catch |err| switch (err) {
                 error.Unsupported => {
                     try diags.render(&sm, ctx.stderr, .{ .format = opts.diag_format, .color = false, .unplaced = if (ctx.req.place_unplaced) opts.input else null });
                     return error.CompileFailed;
@@ -614,6 +686,8 @@ fn run(ctx: *Ctx, arena: std.mem.Allocator) !void {
             try ctx.needOutput(opts);
             ctx.result.object = dxil_out.object;
             ctx.result.reflection = dxil_out.reflection;
+            ctx.result.pdb = dxil_out.pdb;
+            ctx.result.pdb_name = dxil_out.pdb_name;
             if (opts.rootsig_output != null) {
                 const text = (if (m.entries.items.len == 1) m.entries.items[0].root_signature else null) orelse return ctx.fail("-Frs: the shader has no root signature", .{});
                 var d: zdxc.dxil.rootsig.Diagnostic = .{};

@@ -29,6 +29,7 @@ pub const Extra = enum {
     zdxc_ast,
     zdxc_sema,
     zdxc_ir,
+    zdxc_debug,
     zdxc_no_opt,
     zdxc_exp,
     job,
@@ -44,6 +45,7 @@ const extra_options = [_]struct { id: Extra, spelling: []const u8, help: []const
     .{ .id = .zdxc_ast, .spelling = "zdxc-ast", .help = "Preprocess, parse and dump the syntax tree (development)" },
     .{ .id = .zdxc_sema, .spelling = "zdxc-sema", .help = "Run the front end through semantic analysis only (development)" },
     .{ .id = .zdxc_ir, .spelling = "zdxc-ir", .help = "Print the lowered IR instead of compiling (development)" },
+    .{ .id = .zdxc_debug, .spelling = "zdxc-debug", .help = "Carry source positions and variables in the IR; -zdxc-ir prints them (development)" },
     .{ .id = .zdxc_exp, .spelling = "zdxc-exp=", .kind = .joined, .meta = "<knobs>", .help = "EXPERIMENT: driver compile-time knobs (see src/dxil/exp.zig)" },
     .{ .id = .zdxc_no_opt, .spelling = "zdxc-no-opt", .help = "Skip the SPIR-V IR optimizations: inlining, promotion to SSA values (development)" },
     .{ .id = .job, .spelling = "-job=", .kind = .joined, .meta = "<job.json>", .help = "Compile every shader a JSON job file lists, in one process, on all cores (see docs/batch.md)" },
@@ -220,7 +222,7 @@ pub const Support = union(enum) {
     unsupported: []const u8,
 };
 
-const dropped_debug = "debug information and PDBs are not supported by zdxc";
+pub const dropped_debug = "this form of debug information is not supported by zdxc yet";
 const dropped_disasm = "disassembly is not part of zdxc; use dxc -dumpbin to inspect output";
 const dropped_tooling = "this dxc tooling option is not part of zdxc";
 const dropped_internal = "dxc-internal (LLVM pass / codegen debugging) options are not supported";
@@ -252,7 +254,9 @@ pub fn support(id: Id) Support {
         .Gis, .Gfa, .Gfp, .Ges, .Gec, .denorm, .all_resources_bound, .all_resources_bound_, .res_may_alias, .res_may_alias_, .pack_optimized, .pack_optimized_, .pack_prefix_stable, .pack_prefix_stable_, .ffinite_math_only, .fno_finite_math_only, .flegacy_macro_expansion, .flegacy_resource_reservation, .no_legacy_cbuf_layout, .not_use_legacy_cbuf_load_, .enable_payload_qualifiers, .disable_payload_qualifiers, .enable_lifetime_markers, .disable_lifetime_markers, .force_zero_store_lifetimes, .ignore_line_directives, .Qunused_arguments, .fdiagnostics_show_option, .fno_diagnostics_show_option, .fdiagnostics_show_category_EQ, ._vi, .verbose, .v, .encoding, .Wall, .Wdeprecated, ._all_warnings, .Fh, .Vn, .Fsh, .Fre, .Zss, .Zsb, .Qstrip_reflect, .Qstrip_debug, .Qstrip_priv, .Qkeep_reflect_in_dxil, .Qstrip_reflect_from_dxil, .exports, .export_shaders_only, .default_linkage, .fspv_reduce_load_size, .fspv_fix_func_call_arguments, .fspv_preserve_bindings, .Oconfig => .ignored,
 
         // Dropped by design (see the zdxc plan).
-        ._SLASH_Zi, .Zs, .Fd, .Qembed_debug, .Qsource_in_debug_module, .Qpdb_in_private, .fspv_debug_EQ => .{ .unsupported = dropped_debug },
+        // Debug information: SPIR-V's, and line tables for DXIL.
+        ._SLASH_Zi, .fspv_debug_EQ, .Fd, .Qembed_debug => .implemented,
+        .Zs, .Qsource_in_debug_module, .Qpdb_in_private => .{ .unsupported = dropped_debug },
         .Fc, .Cc, .Ni, .No, .Lx, .dumpbin => .{ .unsupported = dropped_disasm },
         .recompile, .link, .ast_dump, .verify, .metal, .external_lib, .external_fn, .setprivate, .getprivate, .setrootsignature, .extractrootsignature, .verifyrootsignature, .rw_unchanged, .rw_skip_function_body, .rw_skip_static, .rw_global_extern_by_default, .rw_keep_user_macro, .rw_extract_entry_uniforms, .rw_remove_unused_globals, .rw_remove_unused_functions, .rw_line_directive, .rw_decl_global_cb, .import_binding_table, .binding_table_define, .ftime_report, .ftime_trace, .ftime_trace_EQ, .ftime_trace_granularity_EQ => .{ .unsupported = dropped_tooling },
         .Odump, .print_before_all, .print_before, .print_after_all, .print_after, .opt_disable, .opt_enable, .opt_select, .memdep_block_scan_limit, .fdisable_loc_tracking, .fnew_inlining_behavior, .preserve_intermediate_values, .skip_serialization, .d_Flag, .d_Joined, .ignore_opt_semdefs, .ignore_semdef, .override_semdef, .precise_output, .disable_exception_handling, .fspv_print_all, .fspv_max_id => .{ .unsupported = dropped_internal },

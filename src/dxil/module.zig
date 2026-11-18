@@ -162,7 +162,55 @@ pub const Inst = struct {
     /// An attached metadata node, as `!dx.nonuniform` on a resource
     /// array's getelementptr (see Module.instMd).
     md: InstMd = .none,
+    /// Where it came from: an index into Module.dbg_locs, from 1 (0:
+    /// nowhere). Passes copy it with the instruction.
+    dbg: u32 = 0,
 };
+
+/// Debug metadata (Module.dbg): written after the module's own, and only
+/// into the debug module. Operands are indices into Module.dbg.
+pub const DbgId = u32;
+
+pub const DbgMd = union(enum) {
+    string: []const u8,
+    value: struct { ty: TypeId, val: Value },
+    node: []const ?DbgId,
+    file: struct { name: DbgId, dir: DbgId },
+    compile_unit: struct { file: DbgId, producer: DbgId, optimized: bool, enums: DbgId, subprograms: DbgId, globals: DbgId },
+    /// `function`: the module function it is the body of (a value); none
+    /// for one that only exists inlined.
+    subprogram: struct { file: DbgId, name: DbgId, line: u32, ty: DbgId, optimized: bool, function: ?DbgId = null },
+    subroutine_type: struct { types: DbgId },
+    lexical_block: struct { scope: DbgId, file: DbgId, line: u32, col: u32 },
+    /// The position of an inlined call.
+    location: struct { line: u32, col: u32, scope: DbgId, inlined_at: ?DbgId },
+    /// `encoding`: DW_ATE_boolean (2), float (4), signed (5), unsigned (7).
+    basic_type: struct { name: DbgId, bits: u32, encoding: u32 },
+    member: struct { name: DbgId, scope: DbgId, base: DbgId, bits: u32, offset: u32 },
+    /// `tag`: DW_TAG_array_type (1; `base` the element, `elements` its
+    /// subrange), class_type (2: vectors and matrices) or structure_type
+    /// (0x13); `elements` the members.
+    composite: struct { tag: u32, name: ?DbgId = null, base: ?DbgId = null, bits: u32, elements: ?DbgId = null },
+    /// An array's element count.
+    subrange: u32,
+    /// `arg`: the parameter's number, from 1 (0: a local).
+    local_var: struct { arg: u32, scope: DbgId, name: DbgId, file: DbgId, line: u32, ty: DbgId },
+    expression: []const u64,
+};
+
+/// A local a source variable is in (Function.dbg_allocas): the alloca's
+/// instruction, the variable, the size in bits of each of its scalars in
+/// the alloca's order, and the position its values are given at.
+pub const DbgAlloca = struct { alloca: u32, variable: DbgId, bits: []const u32, dbg: u32 };
+
+/// `llvm.dbg.value` (Function.dbg_values): from before instruction
+/// `before`, `variable` (or the piece `expr` names) is `val`.
+pub const DbgValue = struct { before: u32, val: Value, variable: DbgId, expr: DbgId, dbg: u32, val_md: DbgId = 0 };
+
+/// An instruction's position: line and column in a scope (a subprogram or
+/// lexical block) and, for inlined code, the call's position (an index
+/// into Module.dbg_locs, from 1).
+pub const DbgLoc = struct { line: u32, col: u32, scope: DbgId, inlined_at: u32 = 0 };
 
 /// An instruction's metadata attachment: an index into Module.inst_mds,
 /// kept out of line (few instructions have one).
@@ -187,6 +235,11 @@ pub const Function = struct {
     num_blocks: u32 = 0,
     /// Instructions in block order; a terminator ends each block.
     insts: std.ArrayList(Inst) = .empty,
+    /// Debug information: the locals holding source variables, until
+    /// promote.zig replaces them by the values the variables take (in
+    /// instruction order).
+    dbg_allocas: std.ArrayList(DbgAlloca) = .empty,
+    dbg_values: std.ArrayList(DbgValue) = .empty,
 };
 
 pub const Metadata = union(enum) {
@@ -223,6 +276,71 @@ pub const Module = struct {
     /// The `!llvm.loop` attachment for `[loop]` loops' back edges (see
     /// loopDontUnroll), once one is made.
     loop_dont_unroll: InstMd = .none,
+    /// Debug information: metadata, named metadata, the positions
+    /// instructions name (Inst.dbg) and, for those that are the position
+    /// of an inlined call, their `location` metadata.
+    dbg: std.ArrayList(DbgMd) = .empty,
+    dbg_named: std.ArrayList(struct { name: []const u8, nodes: []const DbgId }) = .empty,
+    dbg_locs: std.ArrayList(DbgLoc) = .empty,
+    dbg_loc_ids: std.AutoHashMapUnmanaged(DbgLoc, u32) = .empty,
+    dbg_loc_md: std.ArrayList(?DbgId) = .empty,
+    /// Expressions by the piece they name (offset and size in bits; 0, 0:
+    /// the whole variable), and the `i64 0` of llvm.dbg.value's calls.
+    dbg_exprs: std.AutoHashMapUnmanaged([2]u32, DbgId) = .empty,
+    dbg_zero: ?Value = null,
+
+    /// The expression for a piece of a variable (null: all of it).
+    pub fn dbgExpr(m: *Module, piece: ?[2]u32) !DbgId {
+        const key: [2]u32 = piece orelse .{ 0, 0 };
+        if (m.dbg_exprs.get(key)) |id| return id;
+        // (DW_OP_bit_piece.)
+        const id = try m.dbgAdd(.{ .expression = if (piece) |p| &.{ 0x9d, p[0], p[1] } else &.{} });
+        try m.dbg_exprs.put(m.allocator(), key, id);
+        return id;
+    }
+
+    pub fn dbgAdd(m: *Module, md: DbgMd) !DbgId {
+        var owned = md;
+        switch (owned) {
+            .string => |*s| s.* = try m.allocator().dupe(u8, s.*),
+            .node => |*n| n.* = try m.allocator().dupe(?DbgId, n.*),
+            .expression => |*x| x.* = try m.allocator().dupe(u64, x.*),
+            else => {},
+        }
+        try m.dbg.append(m.allocator(), owned);
+        return @intCast(m.dbg.items.len - 1);
+    }
+
+    pub fn dbgNamed(m: *Module, name: []const u8, nodes: []const DbgId) !void {
+        const a = m.allocator();
+        try m.dbg_named.append(a, .{ .name = try a.dupe(u8, name), .nodes = try a.dupe(DbgId, nodes) });
+    }
+
+    /// The Inst.dbg of a position (made once).
+    pub fn dbgLoc(m: *Module, loc: DbgLoc) !u32 {
+        const gop = try m.dbg_loc_ids.getOrPut(m.allocator(), loc);
+        if (!gop.found_existing) {
+            m.dbg_locs.append(m.allocator(), loc) catch |err| {
+                m.dbg_loc_ids.removeByPtr(gop.key_ptr);
+                return err;
+            };
+            gop.value_ptr.* = @intCast(m.dbg_locs.items.len);
+        }
+        return gop.value_ptr.*;
+    }
+
+    /// The `location` metadata of position `loc` (an Inst.dbg), which
+    /// code inlined at it names.
+    pub fn dbgLocMd(m: *Module, loc: u32) !DbgId {
+        const a = m.allocator();
+        if (m.dbg_loc_md.items.len < m.dbg_locs.items.len) try m.dbg_loc_md.appendNTimes(a, null, m.dbg_locs.items.len - m.dbg_loc_md.items.len);
+        if (m.dbg_loc_md.items[loc - 1]) |id| return id;
+        const l = m.dbg_locs.items[loc - 1];
+        const outer: ?DbgId = if (l.inlined_at != 0) try m.dbgLocMd(l.inlined_at) else null;
+        const id = try m.dbgAdd(.{ .location = .{ .line = l.line, .col = l.col, .scope = l.scope, .inlined_at = outer } });
+        m.dbg_loc_md.items[loc - 1] = id;
+        return id;
+    }
 
     pub fn init(gpa: Allocator) Module {
         return .{ .arena = .init(gpa) };
@@ -373,7 +491,7 @@ pub const Module = struct {
     /// with aggregates last, after their elements. The output then depends
     /// only on the code that is left, not on code made and removed again or
     /// on the order constants were first asked for.
-    fn pruneConstants(m: *Module) !void {
+    fn pruneConstants(m: *Module, debug: bool) !void {
         const a = m.allocator();
         const n = m.constants.items.len;
         if (n == 0) return;
@@ -413,6 +531,13 @@ pub const Module = struct {
         };
         for (m.globals.items) |g| if (g.init) |c| {
             _ = walk.map(.{ .constant = c });
+        };
+        // (Last: the debug module's own constants do not move the rest.)
+        if (debug) for (m.dbg.items) |md| if (md == .value) {
+            _ = walk.map(md.value.val);
+        };
+        if (debug) if (m.dbg_zero) |z| {
+            _ = walk.map(z);
         };
         if (walk.failed) return error.OutOfMemory;
 
@@ -468,6 +593,12 @@ pub const Module = struct {
         };
         for (m.globals.items) |*g| if (g.init) |*c| {
             c.* = new_id[c.*];
+        };
+        if (debug) for (m.dbg.items) |*md| if (md.* == .value) {
+            md.value.val = remap.map(md.value.val);
+        };
+        if (debug) if (m.dbg_zero) |z| {
+            m.dbg_zero = remap.map(z);
         };
         m.constants = kept;
         // (Constants made from here on start a new index.)
@@ -549,9 +680,46 @@ pub const Module = struct {
     /// Encode the module as raw LLVM bitcode (starting with 'BC' 0xC0DE).
     pub fn writeBitcode(m: *Module, gpa: Allocator) ![]u8 {
         try m.pruneGlobals();
-        try m.pruneConstants();
+        try m.pruneConstants(false);
         var enc: Encoder = .{ .m = m, .w = .init(gpa) };
         defer enc.w.deinit();
+        return enc.write();
+    }
+
+    /// The module with its debug information (the ILDB part): the same
+    /// code, plus Module.dbg and each instruction's position. Call it
+    /// before `writeBitcode`, which drops the constants only it uses.
+    pub fn writeBitcodeDebug(m: *Module, gpa: Allocator) ![]u8 {
+        var enc: Encoder = .{ .m = m, .w = .init(gpa), .debug = true };
+        defer enc.w.deinit();
+        // Variables: the llvm.dbg.value declaration and its types are in
+        // this module only, and gone again when it is written.
+        const n_types = m.types.items.len;
+        const n_fns = m.functions.items.len;
+        defer {
+            m.functions.shrinkRetainingCapacity(n_fns);
+            for (m.types.items[n_types..]) |t| _ = m.type_ids.remove(t);
+            m.types.shrinkRetainingCapacity(n_types);
+            for (&m.int_types) |*t| if (t.* != no_type and t.* >= n_types) {
+                t.* = no_type;
+            };
+            m.dbg_zero = null;
+        }
+        var any = false;
+        for (m.functions.items) |f| any = any or f.dbg_values.items.len > 0;
+        if (any) {
+            const md_ty = try m.getType(.metadata);
+            const fn_ty = try m.fnType(try m.getType(.void), &.{ md_ty, try m.intType(64), md_ty, md_ty });
+            enc.dbg_value_fn = try m.addFunction(.{ .name = "llvm.dbg.value", .ty = fn_ty, .attrs = .nounwind_readnone });
+            m.dbg_zero = try m.constInt(64, 0);
+            // (Constants are metadata of the module; instructions of the
+            // function, written with it.)
+            for (m.functions.items) |*f| for (f.dbg_values.items) |*dv| if (dv.val == .constant) {
+                dv.val_md = try m.dbgAdd(.{ .value = .{ .ty = m.constants.items[dv.val.constant].ty, .val = dv.val } });
+            };
+        }
+        try m.pruneGlobals();
+        try m.pruneConstants(true);
         return enc.write();
     }
 };
@@ -655,6 +823,119 @@ const Encoder = struct {
     /// ID offset (non-void instructions before it).
     numbered: ?*const Function = null,
     inst_ids: std.ArrayList(u32) = .empty,
+    /// Write the debug metadata and positions.
+    debug: bool = false,
+    /// The llvm.dbg.value declaration (see writeBitcodeDebug).
+    dbg_value_fn: u32 = 0,
+
+    /// DEBUG_LOC: [line, column, scope, inlined at] for the instruction
+    /// just written; DEBUG_LOC_AGAIN for the same position as the last.
+    fn debugLoc(e: *Encoder, dbg: u32, last: *u32) !void {
+        if (dbg == 0) return;
+        if (dbg == last.*) return e.rec(33);
+        const l = e.m.dbg_locs.items[dbg - 1];
+        const at: ?DbgId = if (l.inlined_at != 0) e.m.dbg_loc_md.items[l.inlined_at - 1] else null;
+        try e.ops.appendSlice(e.gpa(), &.{ l.line, l.col, e.dbgRef(l.scope), e.dbgRef(at) });
+        try e.rec(35);
+        last.* = dbg;
+    }
+
+    /// The operand for debug metadata `x` (0: none).
+    fn dbgRef(e: *Encoder, x: ?DbgId) u64 {
+        return if (x) |i| e.m.metadata.items.len + i + 1 else 0;
+    }
+
+    /// Module.dbg, numbered after the module's own metadata.
+    fn writeDebugMetadata(e: *Encoder) !void {
+        const w = &e.w;
+        const a = e.gpa();
+        for (e.m.dbg.items) |md| switch (md) {
+            .string => |s| try w.recordString(1, &.{}, s),
+            .value => |v| {
+                try e.push(v.ty);
+                try e.push(e.valueId(null, v.val));
+                try e.rec(2);
+            },
+            .node => |ops| {
+                for (ops) |op| try e.push(e.dbgRef(op));
+                try e.rec(3);
+            },
+            // FILE: [distinct, filename, directory]
+            .file => |f| {
+                try e.ops.appendSlice(a, &.{ 0, e.dbgRef(f.name), e.dbgRef(f.dir) });
+                try e.rec(16);
+            },
+            // COMPILE_UNIT: [distinct, language (DW_LANG_C_plus_plus),
+            //   file, producer, optimized, flags, runtime version, split
+            //   name, emission kind (full), enums, retained types,
+            //   subprograms, globals, imported entities, dwo id]
+            .compile_unit => |c| {
+                try e.ops.appendSlice(a, &.{ 1, 4, e.dbgRef(c.file), e.dbgRef(c.producer), @intFromBool(c.optimized), 0, 0, 0, 1, e.dbgRef(c.enums), 0, e.dbgRef(c.subprograms), e.dbgRef(c.globals), 0, 0 });
+                try e.rec(20);
+            },
+            // SUBPROGRAM: [distinct, scope, name, linkage name, file, line,
+            //   type, local, definition, scope line, containing type,
+            //   virtuality, virtual index, flags (prototyped), optimized,
+            //   function, template parameters, declaration, variables]
+            .subprogram => |s| {
+                try e.ops.appendSlice(a, &.{ 0, e.dbgRef(s.file), e.dbgRef(s.name), 0, e.dbgRef(s.file), s.line, e.dbgRef(s.ty), 0, 1, s.line, 0, 0, 0, 256, @intFromBool(s.optimized), e.dbgRef(s.function), 0, 0, 0 });
+                try e.rec(21);
+            },
+            // SUBROUTINE_TYPE: [distinct, flags, types]
+            .subroutine_type => |s| {
+                try e.ops.appendSlice(a, &.{ 0, 0, e.dbgRef(s.types) });
+                try e.rec(19);
+            },
+            // LEXICAL_BLOCK: [distinct, scope, file, line, column]
+            .lexical_block => |b| {
+                try e.ops.appendSlice(a, &.{ 1, e.dbgRef(b.scope), e.dbgRef(b.file), b.line, b.col });
+                try e.rec(22);
+            },
+            // LOCATION: [distinct, line, column, scope (an id, not an
+            //   operand), inlined at]
+            .location => |l| {
+                try e.ops.appendSlice(a, &.{ 1, l.line, l.col, e.m.metadata.items.len + l.scope, e.dbgRef(l.inlined_at) });
+                try e.rec(7);
+            },
+            // BASIC_TYPE: [distinct, tag (DW_TAG_base_type), name, size,
+            //   align, encoding]
+            .basic_type => |t| {
+                try e.ops.appendSlice(a, &.{ 0, 0x24, e.dbgRef(t.name), t.bits, t.bits, t.encoding });
+                try e.rec(15);
+            },
+            // DERIVED_TYPE: [distinct, tag (DW_TAG_member), name, file,
+            //   line, scope, base type, size, align, offset, flags
+            //   (public), extra data]
+            .member => |t| {
+                try e.ops.appendSlice(a, &.{ 0, 0x0d, e.dbgRef(t.name), 0, 0, e.dbgRef(t.scope), e.dbgRef(t.base), t.bits, 32, t.offset, 3, 0 });
+                try e.rec(17);
+            },
+            // COMPOSITE_TYPE: [distinct, tag, name, file, line, scope, base
+            //   type, size, align, offset, flags, elements, runtime
+            //   language, vtable holder, template parameters, identifier]
+            .composite => |t| {
+                try e.ops.appendSlice(a, &.{ 0, t.tag, e.dbgRef(t.name), 0, 0, 0, e.dbgRef(t.base), t.bits, 32, 0, 0, e.dbgRef(t.elements), 0, 0, 0, 0 });
+                try e.rec(18);
+            },
+            // SUBRANGE: [distinct, count, lower bound]
+            .subrange => |count| {
+                try e.ops.appendSlice(a, &.{ 0, count, 0 });
+                try e.rec(13);
+            },
+            // LOCAL_VAR: [distinct, tag (DW_TAG_auto_variable or
+            //   arg_variable), scope, name, file, line, type, arg, flags]
+            .local_var => |v| {
+                try e.ops.appendSlice(a, &.{ 0, if (v.arg != 0) 0x101 else 0x100, e.dbgRef(v.scope), e.dbgRef(v.name), e.dbgRef(v.file), v.line, e.dbgRef(v.ty), v.arg, 0 });
+                try e.rec(28);
+            },
+            // EXPRESSION: [distinct, elements...]
+            .expression => |els| {
+                try e.push(0);
+                try e.ops.appendSlice(a, els);
+                try e.rec(29);
+            },
+        };
+    }
 
     fn gpa(e: *Encoder) Allocator {
         return e.w.gpa;
@@ -881,7 +1162,7 @@ const Encoder = struct {
 
     fn writeMetadata(e: *Encoder) !void {
         const m = e.m;
-        if (m.metadata.items.len == 0 and m.named_metadata.items.len == 0) return;
+        if (m.metadata.items.len == 0 and m.named_metadata.items.len == 0 and !e.debug) return;
         const w = &e.w;
         try w.enterBlock(block_metadata, 3);
         for (m.metadata.items) |md| {
@@ -902,11 +1183,17 @@ const Encoder = struct {
                 },
             }
         }
+        if (e.debug) try e.writeDebugMetadata();
         for (m.named_metadata.items) |nmd| {
             try w.recordString(4, &.{}, nmd.name);
             for (nmd.nodes) |n| try e.push(n);
             try e.rec(10);
         }
+        if (e.debug) for (m.dbg_named.items) |nmd| {
+            try w.recordString(4, &.{}, nmd.name);
+            for (nmd.nodes) |n| try e.push(m.metadata.items.len + n);
+            try e.rec(10);
+        };
         try w.endBlock();
     }
 
@@ -944,7 +1231,50 @@ const Encoder = struct {
 
         const nargs: u32 = @intCast(e.m.types.items[f.ty].function.params.len);
         var inst_id: u32 = e.moduleValueCount() + nargs;
-        for (f.insts.items) |inst| {
+        var last_dbg: u32 = 0;
+        // Variables' values: the instructions among them are metadata of
+        // the function (METADATA_VALUE: [type, value]), numbered after the
+        // module's, in the order the calls below name them.
+        const dvs: []const DbgValue = if (e.debug) f.dbg_values.items else &.{};
+        const md_count: u32 = @intCast(e.m.metadata.items.len + e.m.dbg.items.len);
+        {
+            var any = false;
+            for (dvs) |dv| any = any or dv.val == .inst;
+            if (any) {
+                try w.enterBlock(block_metadata, 3);
+                for (dvs) |dv| if (dv.val == .inst) {
+                    try e.push(e.typeOf(f, dv.val));
+                    try e.push(e.valueId(f, dv.val));
+                    try e.rec(2);
+                };
+                try w.endBlock();
+            }
+        }
+        var next_dv: usize = 0;
+        var next_local: u32 = md_count;
+        for (f.insts.items, 0..) |inst, at| {
+            // call void @llvm.dbg.value(metadata value, i64 0, metadata
+            // variable, metadata expression): metadata operands are their
+            // ids, relative as values are.
+            while (next_dv < dvs.len and dvs[next_dv].before == at) : (next_dv += 1) {
+                const dv = dvs[next_dv];
+                const callee = e.m.functions.items[e.dbg_value_fn];
+                var val_md: u32 = @intCast(e.m.metadata.items.len + dv.val_md);
+                if (dv.val == .inst) {
+                    val_md = next_local;
+                    next_local += 1;
+                }
+                try e.push(0);
+                try e.push(1 << 15);
+                try e.push(callee.ty);
+                try e.pushValueAndType(f, inst_id, .{ .function = e.dbg_value_fn });
+                try e.push(inst_id -% val_md);
+                try e.pushValue(f, inst_id, e.m.dbg_zero.?);
+                try e.push(inst_id -% @as(u32, @intCast(e.m.metadata.items.len + dv.variable)));
+                try e.push(inst_id -% @as(u32, @intCast(e.m.metadata.items.len + dv.expr)));
+                try e.rec(34);
+                try e.debugLoc(dv.dbg, &last_dbg);
+            }
             switch (inst.op) {
                 .ret => |v| {
                     if (v) |val| try e.pushValueAndType(f, inst_id, val);
@@ -1086,6 +1416,7 @@ const Encoder = struct {
                     try e.rec(16);
                 },
             }
+            if (e.debug) try e.debugLoc(inst.dbg, &last_dbg);
             if (e.m.types.items[inst.ty] != .void) inst_id += 1;
         }
         // METADATA_ATTACHMENT: [instruction index, (kind, node)...]

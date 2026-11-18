@@ -404,6 +404,36 @@ pub fn run(a: Allocator, m: *module.Module, func: u32, dyn: *const std.AutoHashM
         const len: u32 = if (direct[i]) 1 else @intCast(m.types.items[inst.op.alloca.elem].array.len);
         @memset(var_ty[var_base[i]..][0..len], elem_ty[i]);
     }
+    // Debug information: the alloca of each variable, for the ones that
+    // hold source variables.
+    const have_dbg = f.dbg_allocas.items.len > 0;
+    var dbg_of: std.AutoHashMapUnmanaged(u32, module.DbgAlloca) = .empty;
+    const var_alloca: []u32 = if (have_dbg) try a.alloc(u32, nv) else &.{};
+    if (have_dbg) {
+        for (f.dbg_allocas.items) |d| try dbg_of.put(a, d.alloca, d);
+        for (allocas.items) |i| {
+            if (var_base[i] == none) continue;
+            const len: u32 = if (direct[i]) 1 else if (leaves[i].len > 0) @intCast(leaves[i].len) else @intCast(m.types.items[insts[i].op.alloca.elem].array.len);
+            @memset(var_alloca[var_base[i]..][0..len], i);
+        }
+    }
+    // Where a variable gets a value that is still there: llvm.dbg.value
+    // for the piece of the source variable it is.
+    var dbg_values: std.ArrayList(module.DbgValue) = .empty;
+    const Note = struct {
+        fn add(mm: *module.Module, list: *std.ArrayList(module.DbgValue), d: module.DbgAlloca, k: u32, val: Value, before: usize) Allocator.Error!void {
+            if (k >= d.bits.len) return;
+            switch (val) {
+                .inst => |x| if (x == none) return,
+                .constant => {},
+                else => return,
+            }
+            var offset: u32 = 0;
+            for (d.bits[0..k]) |b| offset += b;
+            const expr = try mm.dbgExpr(if (d.bits.len == 1) null else .{ offset, d.bits[k] });
+            try list.append(mm.allocator(), .{ .before = @intCast(before), .val = val, .variable = d.variable, .expr = expr, .dbg = d.dbg });
+        }
+    };
     // Components a dynamic index can reach stay in memory, and so does
     // their alloca.
     const pinned = try a.alloc(bool, nv);
@@ -768,7 +798,26 @@ pub fn run(a: Allocator, m: *module.Module, func: u32, dyn: *const std.AutoHashM
             for (incoming[j], edges) |in, *e| e.* = .{ .val = map.visit(in.val, .other), .block = new_block[in.block] };
             out.appendAssumeCapacity(.{ .ty = var_ty[phi_var.items[j]], .op = .{ .phi = .{ .incoming = edges } } });
         };
-        while (i < block_start[b + 1]) : (i += 1) if (live[i]) {
+        if (have_dbg) for (bphis[bphi_off[b]..bphi_off[b + 1]]) |j| if (live[n + j]) {
+            const v = phi_var.items[j];
+            if (dbg_of.get(var_alloca[v])) |d| try Note.add(m, &dbg_values, d, v - var_base[var_alloca[v]], .{ .inst = index[n + j] }, out.items.len);
+        };
+        while (i < block_start[b + 1]) : (i += 1) if (!live[i]) {
+            // (A store that is gone: the variable's value from here.)
+            if (have_dbg and access[i] != none and insts[i].op == .store) {
+                const v = access[i];
+                if (dbg_of.get(var_alloca[v])) |d| {
+                    var val = map.visit(insts[i].op.store.val, .other);
+                    // (A local of ints and floats holds i32s: the value
+                    // before the cast, when the cast itself is gone.)
+                    if (val == .inst and val.inst == none) {
+                        const x = resolve(repl, insts[i].op.store.val);
+                        if (x == .inst and x.inst < n and insts[x.inst].op == .cast and insts[x.inst].op.cast.op == .bitcast) val = map.visit(insts[x.inst].op.cast.val, .other);
+                    }
+                    try Note.add(m, &dbg_values, d, v - var_base[var_alloca[v]], val, out.items.len);
+                }
+            }
+        } else {
             var inst = insts[i];
             try operands(true, ma, &inst, &map);
             if (inst.op == .gep) try clampIndex(m, &inst.op.gep);
@@ -790,6 +839,10 @@ pub fn run(a: Allocator, m: *module.Module, func: u32, dyn: *const std.AutoHashM
     }
     f.insts = out;
     f.num_blocks = kept;
+    if (have_dbg) {
+        f.dbg_values = dbg_values;
+        f.dbg_allocas = .empty;
+    }
 }
 
 /// See run. Returns the blocks still reachable.

@@ -209,6 +209,7 @@ pub fn upgrade(e: anytype, has_tess_control: bool) !void {
         const s = e.b.sections.get(.functions).items;
         var at: usize = 0;
         while (at < s.len and !writes_output) : (at += s[at] >> 16) {
+            if (s[at] & 0xffff == 8) continue; // OpLine: no ids but the file
             for (s[at + 1 .. at + (s[at] >> 16)]) |x| if (p.storageOf(x) == 3) {
                 writes_output = true;
             };

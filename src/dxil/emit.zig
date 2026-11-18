@@ -31,6 +31,8 @@ const sccp = @import("sccp.zig");
 const cfg = @import("cfg.zig");
 const cse = @import("cse.zig");
 const opt = @import("../ir/opt.zig");
+const source = @import("../front/source.zig");
+const pdb = @import("pdb.zig");
 
 const TypeId = types.TypeId;
 const TypeTable = types.TypeTable;
@@ -52,7 +54,28 @@ pub fn emit(gpa: Allocator, m: *const ir.Module, profile: shader.Profile, diags:
 
 /// The DXIL container and its reflection (reflect.zig), both owned by the
 /// caller.
-pub const Output = struct { object: []u8, reflection: []u8 };
+pub const Output = struct {
+    object: []u8,
+    reflection: []u8,
+    /// With `Debug.pdb`: the PDB and the name the container gives for it.
+    pdb: ?[]u8 = null,
+    pdb_name: ?[]u8 = null,
+};
+
+/// -Zi: line tables for the module (the IR has positions).
+pub const Debug = struct {
+    sm: *const source.SourceManager,
+    main_file: source.FileId,
+    /// The command line (dx.source.args) and the compiler's name.
+    args: []const []const u8 = &.{},
+    producer: []const u8 = "zdxc",
+    /// -Qembed_debug: the debug module in the container (ILDB).
+    embed: bool = false,
+    /// Write a PDB; `pdb_name` is -Fd (a directory when it ends in a
+    /// separator; none: the hash).
+    pdb: bool = false,
+    pdb_name: ?[]const u8 = null,
+};
 
 pub fn emitWithReflection(gpa: Allocator, m: *const ir.Module, profile: shader.Profile, diags: *diag.Diagnostics, optimize: bool) Error!Output {
     return emitWithReflectionAt(gpa, m, profile, diags, if (optimize) .full else .none);
@@ -64,15 +87,27 @@ pub fn emitWithReflection(gpa: Allocator, m: *const ir.Module, profile: shader.P
 pub const Optimize = enum { none, debug, full };
 
 pub fn emitWithReflectionAt(gpa: Allocator, m: *const ir.Module, profile: shader.Profile, diags: *diag.Diagnostics, level: Optimize) Error!Output {
+    return emitDebug(gpa, m, profile, diags, level, null);
+}
+
+pub fn emitDebug(gpa: Allocator, m: *const ir.Module, profile: shader.Profile, diags: *diag.Diagnostics, level: Optimize, dbg: ?Debug) Error!Output {
     var arena_state: BumpArena = .init(gpa);
     defer arena_state.deinit();
-    var e: Emitter = .{ .arena = arena_state.allocator(), .dm = .init(gpa), .m = m, .t = m.types, .profile = profile, .diags = diags, .optimize = level == .full, .promote_only = level == .debug };
+    var e: Emitter = .{ .arena = arena_state.allocator(), .dm = .init(gpa), .m = m, .t = m.types, .profile = profile, .diags = diags, .optimize = level == .full, .promote_only = level == .debug, .dbg = dbg };
     defer e.dm.deinit();
+    if (dbg != null) {
+        e.dbg_scopes = try e.arena.alloc(?module.DbgId, m.scopes.items.len);
+        @memset(e.dbg_scopes, null);
+        e.dbg_sps = try e.arena.alloc(?module.DbgId, m.functions.items.len);
+        @memset(e.dbg_sps, null);
+    }
+    errdefer if (e.pdb) |x| gpa.free(x);
+    errdefer if (e.pdb_name) |x| gpa.free(x);
     // Native 16-bit types are laid out at their own size.
     if (m.native_16bit) e.dm.datalayout = "e-m:e-p:32:32-i1:32-i8:8-i16:16-i32:32-i64:64-f16:16-f32:32-f64:64-n8:16:32:64";
     const object = try e.run(gpa);
     errdefer gpa.free(object);
-    return .{ .object = object, .reflection = e.reflection orelse return error.OutOfMemory };
+    return .{ .object = object, .reflection = e.reflection orelse return error.OutOfMemory, .pdb = e.pdb, .pdb_name = e.pdb_name };
 }
 
 /// A lowered IR value.
@@ -237,6 +272,16 @@ const Frame = struct {
     param_copies: []const u32 = &.{},
     /// Array locals of an inlined callee, back to the pool on return.
     arrays: std.ArrayList(struct { ty: TypeId, ptr: Ptr }) = .empty,
+    /// Debug information: the position of the call this is inlined at (a
+    /// module.Inst.dbg; 0 for the function's own body), and whether its
+    /// instructions have none (the entry's wrapper, which is not in the
+    /// source).
+    inlined_at: u32 = 0,
+    no_dbg: bool = false,
+    /// Per instruction of `f`: the source variable it is the storage of
+    /// (an index into `f.vars`, from 1; 0: none). Empty unless variables
+    /// are described.
+    var_at: []const u32 = &.{},
 };
 
 /// Hash maps keyed by a Value (or a Value and an offset). A Value has
@@ -297,6 +342,27 @@ const Emitter = struct {
     t: *TypeTable,
     profile: shader.Profile,
     entry: ir.Entry = undefined,
+    /// -Zi: the position new instructions get (a module.Inst.dbg), the
+    /// module function being filled, and the debug metadata made so far:
+    /// per IR scope and function, by string and by file name.
+    dbg: ?Debug = null,
+    cur_dbg: u32 = 0,
+    dbg_fn_name: []const u8 = "",
+    dbg_scopes: []?module.DbgId = &.{},
+    dbg_sps: []?module.DbgId = &.{},
+    dbg_sp_list: std.ArrayList(module.DbgId) = .empty,
+    dbg_sp_fns: std.ArrayList(struct { sp: module.DbgId, name: []const u8 }) = .empty,
+    dbg_strings: std.StringHashMapUnmanaged(module.DbgId) = .empty,
+    dbg_files: std.StringHashMapUnmanaged(module.DbgId) = .empty,
+    /// Variables (-Od): debug types by HLSL type, variables by scope and
+    /// index in their function, and the locals holding them in the
+    /// function being lowered (by the emitter's instruction id).
+    dbg_types: std.AutoHashMapUnmanaged(TypeId, module.DbgId) = .empty,
+    dbg_var_ids: std.AutoHashMapUnmanaged([2]u32, module.DbgId) = .empty,
+    dbg_allocas: std.ArrayList(module.DbgAlloca) = .empty,
+    debug_bitcode: ?[]const u8 = null,
+    pdb: ?[]u8 = null,
+    pdb_name: ?[]u8 = null,
     diags: *diag.Diagnostics,
 
     main_fn: u32 = 0,
@@ -456,9 +522,258 @@ const Emitter = struct {
             },
             else => {},
         }
-        try e.insts.put(e.arena, id, .{ .ty = ty, .op = op });
+        try e.insts.put(e.arena, id, .{ .ty = ty, .op = op, .dbg = e.cur_dbg });
         try e.blocks.items[e.cur].append(e.arena, id);
         return .{ .inst = id };
+    }
+
+    // ------------------------------------------------------------------
+    // Debug information (-Zi)
+
+    fn dbgString(e: *Emitter, s: []const u8) Error!module.DbgId {
+        if (e.dbg_strings.get(s)) |id| return id;
+        const id = try e.dm.dbgAdd(.{ .string = s });
+        try e.dbg_strings.put(e.arena, s, id);
+        return id;
+    }
+
+    fn dbgFile(e: *Emitter, name: []const u8) Error!module.DbgId {
+        if (e.dbg_files.get(name)) |id| return id;
+        const id = try e.dm.dbgAdd(.{ .file = .{ .name = try e.dbgString(name), .dir = try e.dbgString("") } });
+        try e.dbg_files.put(e.arena, name, id);
+        return id;
+    }
+
+    /// File name, line and column of a position.
+    fn dbgPos(e: *Emitter, loc_in: source.Loc) struct { file: []const u8, line: u32, col: u32 } {
+        const sm = e.dbg.?.sm;
+        if (loc_in.isNone()) return .{ .file = sm.file(e.dbg.?.main_file).path, .line = 0, .col = 0 };
+        const loc = sm.fileLoc(loc_in);
+        const lc = sm.lineCol(loc);
+        const p = sm.presumedLine(loc.file, lc.line);
+        return .{ .file = p.file, .line = p.line, .col = lc.col };
+    }
+
+    /// The subprogram or lexical block of an IR scope. A function whose
+    /// body `frame` is (not an inlined copy) is the module function's.
+    fn dbgScope(e: *Emitter, s: ir.ScopeId, frame: *const Frame) Error!module.DbgId {
+        if (e.dbg_scopes[s.index()]) |id| return id;
+        const sc = e.m.scopes.items[s.index()];
+        const p = e.dbgPos(sc.loc);
+        const file = try e.dbgFile(p.file);
+        const id = if (sc.parent != .none)
+            try e.dm.dbgAdd(.{ .lexical_block = .{ .scope = try e.dbgScope(sc.parent, frame), .file = file, .line = p.line, .col = p.col } })
+        else if (e.dbg_sps[sc.func]) |sp| sp else blk: {
+            const f = e.m.functions.items[sc.func];
+            const name = if (std.mem.startsWith(u8, f.name, "src.")) f.name[4..] else f.name;
+            // (No types yet: a function of nothing.)
+            const ty = try e.dm.dbgAdd(.{ .subroutine_type = .{ .types = try e.dm.dbgAdd(.{ .node = &.{null} }) } });
+            const sp = try e.dm.dbgAdd(.{ .subprogram = .{ .file = file, .name = try e.dbgString(name), .line = p.line, .ty = ty, .optimized = e.optimize } });
+            e.dbg_sps[sc.func] = sp;
+            try e.dbg_sp_list.append(e.arena, sp);
+            if (frame.inlined_at == 0) try e.dbg_sp_fns.append(e.arena, .{ .sp = sp, .name = e.dbg_fn_name });
+            break :blk sp;
+        };
+        e.dbg_scopes[s.index()] = id;
+        return id;
+    }
+
+    /// The size in bits of each scalar of a value of `ty`, in the order
+    /// locals hold them; false for types that are not described.
+    fn dbgFlatBits(e: *Emitter, ty: TypeId, out: *std.ArrayList(u32)) Error!bool {
+        switch (e.t.get(ty)) {
+            // (bools are held as i32.)
+            .scalar => |s| try out.append(e.arena, if (s == .bool) 32 else s.size() * 8),
+            .@"enum" => try out.append(e.arena, 32),
+            .vector => |v| try out.appendNTimes(e.arena, if (v.elem == .bool) 32 else v.elem.size() * 8, v.len),
+            .matrix => |mx| try out.appendNTimes(e.arena, if (mx.elem == .bool) 32 else mx.elem.size() * 8, @as(u32, mx.rows) * mx.cols),
+            .array => |ar| {
+                if (ar.len == 0) return false;
+                for (0..ar.len) |_| if (!try e.dbgFlatBits(ar.elem, out)) return false;
+            },
+            .@"struct" => |st| {
+                if (st.bases.items.len != 0) return false;
+                for (st.fields.items) |fld| if (!try e.dbgFlatBits(fld.type, out)) return false;
+            },
+            else => return false,
+        }
+        return true;
+    }
+
+    fn dbgTotalBits(e: *Emitter, ty: TypeId) Error!u32 {
+        var bits: std.ArrayList(u32) = .empty;
+        _ = try e.dbgFlatBits(ty, &bits);
+        var n: u32 = 0;
+        for (bits.items) |b| n +|= b;
+        return n;
+    }
+
+    /// The debug type of an HLSL type `dbgFlatBits` describes: members
+    /// are laid out one after the other, as the pieces of a value are.
+    fn dbgType(e: *Emitter, ty: TypeId) Error!module.DbgId {
+        if (e.dbg_types.get(ty)) |id| return id;
+        const dm = &e.dm;
+        const bits = try e.dbgTotalBits(ty);
+        const Members = struct {
+            /// A class or structure and its members (name, type, bits).
+            fn make(em: *Emitter, tag: u32, name: []const u8, total: u32, names: []const []const u8, tys: []const module.DbgId, sizes: []const u32) Error!module.DbgId {
+                const id = try em.dm.dbgAdd(.{ .composite = .{ .tag = tag, .name = try em.dbgString(name), .bits = total } });
+                const els = try em.arena.alloc(?module.DbgId, names.len);
+                var offset: u32 = 0;
+                for (els, names, tys, sizes) |*o, n, t, s| {
+                    o.* = try em.dm.dbgAdd(.{ .member = .{ .name = try em.dbgString(n), .scope = id, .base = t, .bits = s, .offset = offset } });
+                    offset +|= s;
+                }
+                em.dm.dbg.items[id].composite.elements = try em.dm.dbgAdd(.{ .node = els });
+                return id;
+            }
+        };
+        const id: module.DbgId = switch (e.t.get(ty)) {
+            .scalar, .@"enum" => blk: {
+                const s = e.t.component(ty).?;
+                const encoding: u32 = if (s == .bool) 2 else if (s.isFloat()) 4 else switch (s) {
+                    .uint, .min16uint, .uint16, .uint64, .uint8_4packed => 7,
+                    else => 5,
+                };
+                break :blk try dm.dbgAdd(.{ .basic_type = .{ .name = try e.dbgString(s.name()), .bits = bits, .encoding = encoding } });
+            },
+            .vector => |v| blk: {
+                const elem = try e.dbgType(try e.t.scalar(v.elem));
+                const names = [_][]const u8{ "x", "y", "z", "w" };
+                const n = @min(v.len, 4);
+                const tys: [4]module.DbgId = @splat(elem);
+                const sizes: [4]u32 = @splat(bits / @max(v.len, 1));
+                break :blk try Members.make(e, 2, try e.t.format(e.arena, ty), bits, names[0..n], tys[0..n], sizes[0..n]);
+            },
+            // (Row by row, as locals hold them.)
+            .matrix => |mx| blk: {
+                const elem = try e.dbgType(try e.t.scalar(mx.elem));
+                const count = @as(u32, mx.rows) * mx.cols;
+                const names = try e.arena.alloc([]const u8, count);
+                for (names, 0..) |*n, k| n.* = try std.fmt.allocPrint(e.arena, "_{d}{d}", .{ k / mx.cols + 1, k % mx.cols + 1 });
+                const tys = try e.arena.alloc(module.DbgId, count);
+                @memset(tys, elem);
+                const sizes = try e.arena.alloc(u32, count);
+                @memset(sizes, bits / @max(count, 1));
+                break :blk try Members.make(e, 2, try e.t.format(e.arena, ty), bits, names, tys, sizes);
+            },
+            .array => |ar| try dm.dbgAdd(.{ .composite = .{
+                .tag = 1,
+                .base = try e.dbgType(ar.elem),
+                .bits = bits,
+                .elements = try dm.dbgAdd(.{ .node = &.{try dm.dbgAdd(.{ .subrange = ar.len })} }),
+            } }),
+            .@"struct" => |st| blk: {
+                const count = st.fields.items.len;
+                const names = try e.arena.alloc([]const u8, count);
+                const tys = try e.arena.alloc(module.DbgId, count);
+                const sizes = try e.arena.alloc(u32, count);
+                for (st.fields.items, names, tys, sizes) |fld, *n, *t, *s| {
+                    n.* = fld.name;
+                    t.* = try e.dbgType(fld.type);
+                    s.* = try e.dbgTotalBits(fld.type);
+                }
+                break :blk try Members.make(e, 0x13, st.name, bits, names, tys, sizes);
+            },
+            else => unreachable,
+        };
+        try e.dbg_types.put(e.arena, ty, id);
+        return id;
+    }
+
+    /// Source variable `vi` of `frame`'s function is in the local `val`:
+    /// noted for promote.zig, which gives its values (see finish).
+    fn dbgVariable(e: *Emitter, frame: *const Frame, vi: u32, val: Lowered) Error!void {
+        const p = switch (val) {
+            .ptr => |x| x,
+            else => return,
+        };
+        // (Whole locals only.)
+        if (p.base != .inst or p.offset_const != 0 or p.offset_dyn != null or p.addr_space != 0) return;
+        const v = frame.f.vars.items[vi];
+        if (v.scope == .none) return;
+        var bits: std.ArrayList(u32) = .empty;
+        if (!try e.dbgFlatBits(v.ty, &bits)) return;
+        const arr = e.dm.types.items[p.array_ty];
+        if (arr != .array or arr.array.len != bits.items.len) return;
+        const pos = e.dbgPos(v.loc);
+        const scope = try e.dbgScope(v.scope, frame);
+        const gop = try e.dbg_var_ids.getOrPut(e.arena, .{ v.scope.index(), vi });
+        if (!gop.found_existing) {
+            gop.value_ptr.* = try e.dm.dbgAdd(.{ .local_var = .{
+                .arg = v.arg,
+                .scope = scope,
+                .name = try e.dbgString(v.name),
+                .file = try e.dbgFile(pos.file),
+                .line = pos.line,
+                .ty = try e.dbgType(v.ty),
+            } });
+        }
+        try e.dbg_allocas.append(e.arena, .{
+            .alloca = p.base.inst,
+            .variable = gop.value_ptr.*,
+            .bits = bits.items,
+            // (dbg.value is at the variable's declaration, as dxc's.)
+            .dbg = try e.dm.dbgLoc(.{ .line = pos.line, .col = pos.col, .scope = scope, .inlined_at = frame.inlined_at }),
+        });
+    }
+
+    /// The module.Inst.dbg of an IR position in `frame`.
+    fn dbgFor(e: *Emitter, frame: *const Frame, d: ir.DebugLoc) Error!u32 {
+        if (frame.no_dbg or d.loc.isNone() or d.scope == .none) return 0;
+        const p = e.dbgPos(d.loc);
+        return e.dm.dbgLoc(.{ .line = p.line, .col = p.col, .scope = try e.dbgScope(d.scope, frame), .inlined_at = frame.inlined_at });
+    }
+
+    /// The compile unit, the module flags and the source (dx.source.*),
+    /// once the module's functions are final.
+    fn dbgFinish(e: *Emitter) Error!void {
+        const dm = &e.dm;
+        const dbg = e.dbg.?;
+        for (e.dbg_sp_fns.items) |x| if (dm.findFunction(x.name)) |fi| {
+            const v = try dm.dbgAdd(.{ .value = .{ .ty = try dm.ptrType(dm.functions.items[fi].ty), .val = .{ .function = fi } } });
+            dm.dbg.items[x.sp].subprogram.function = v;
+        };
+        const files = dbg.sm.files.items;
+        const main = files[dbg.main_file].path;
+        const empty = try dm.dbgAdd(.{ .node = &.{} });
+        const sps = try e.arena.alloc(?module.DbgId, e.dbg_sp_list.items.len);
+        for (sps, e.dbg_sp_list.items) |*o, sp| o.* = sp;
+        const cu = try dm.dbgAdd(.{ .compile_unit = .{
+            .file = try e.dbgFile(main),
+            .producer = try e.dbgString(dbg.producer),
+            .optimized = e.optimize,
+            .enums = empty,
+            .subprograms = try dm.dbgAdd(.{ .node = sps }),
+            .globals = empty,
+        } });
+        try dm.dbgNamed("llvm.dbg.cu", &.{cu});
+        const i32t = try dm.intType(32);
+        const Int = struct {
+            fn md(m: *module.Module, ty: module.TypeId, v: i64) !module.DbgId {
+                return m.dbgAdd(.{ .value = .{ .ty = ty, .val = try m.constInt(32, v) } });
+            }
+        };
+        const warn = try Int.md(dm, i32t, 2);
+        try dm.dbgNamed("llvm.module.flags", &.{
+            try dm.dbgAdd(.{ .node = &.{ warn, try e.dbgString("Dwarf Version"), try Int.md(dm, i32t, 4) } }),
+            try dm.dbgAdd(.{ .node = &.{ warn, try e.dbgString("Debug Info Version"), try Int.md(dm, i32t, 3) } }),
+        });
+        // The main file, then the files it includes (each once).
+        var contents: std.ArrayList(module.DbgId) = .empty;
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        for (0..files.len + 1) |k| {
+            const file = files[if (k == 0) dbg.main_file else k - 1];
+            if (k != 0 and file.included_from.isNone()) continue;
+            if ((try seen.fetchPut(e.arena, file.path, {})) != null) continue;
+            try contents.append(e.arena, try dm.dbgAdd(.{ .node = &.{ try e.dbgString(file.path), try e.dbgString(file.text) } }));
+        }
+        try dm.dbgNamed("dx.source.contents", contents.items);
+        try dm.dbgNamed("dx.source.defines", &.{empty});
+        try dm.dbgNamed("dx.source.mainFileName", &.{try dm.dbgAdd(.{ .node = &.{try e.dbgString(main)} })});
+        const args = try e.arena.alloc(?module.DbgId, dbg.args.len);
+        for (args, dbg.args) |*o, s| o.* = try e.dbgString(s);
+        try dm.dbgNamed("dx.source.args", &.{try dm.dbgAdd(.{ .node = args })});
     }
 
     fn addPrologue(e: *Emitter, ty: DType, op: @FieldType(module.Inst, "op")) Error!Value {
@@ -719,6 +1034,7 @@ const Emitter = struct {
         e.cur = try e.newBlock();
         const zl = stats.begin(.dxil_lower);
         try e.createHandles();
+        e.dbg_fn_name = entry.name;
         _ = try e.inlineCall(entry.wrapper, &.{});
         zl.end();
         try e.finish(e.main_fn);
@@ -739,6 +1055,8 @@ const Emitter = struct {
             e.pc_fn = try e.dm.addFunction(.{ .name = name[0 .. name.len - ".wrapper".len], .ty = fn_ty, .num_blocks = 1 });
             e.cur = try e.newBlock();
             try e.createHandles();
+            e.cur_dbg = 0;
+            e.dbg_fn_name = name[0 .. name.len - ".wrapper".len];
             _ = try e.inlineCall(pw, &.{});
             try e.finish(e.pc_fn.?);
         }
@@ -855,6 +1173,7 @@ const Emitter = struct {
     fn runLibrary(e: *Emitter, gpa: Allocator) Error![]u8 {
         const m = e.m;
         e.lib = true;
+        if (e.dbg != null) return e.unsupported("debug information (-Zi) for libraries is not supported yet", .{});
         // Prerelease shader models get experimental RDAT tables.
         if (e.profile.minor >= 11 and m.entries.items.len > 0) return e.unsupported("libraries for prerelease shader models (experimental RDAT) are not supported yet", .{});
         // Prerelease shader models get experimental RDAT tables.
@@ -1684,6 +2003,12 @@ const Emitter = struct {
         while (it.next()) |kv| try ranges.put(e.arena, map[kv.key_ptr.*], kv.value_ptr.*);
         e.dyn_ranges.clearRetainingCapacity();
         e.array_pool.clearRetainingCapacity();
+        for (e.dbg_allocas.items) |d| {
+            var x = d;
+            x.alloca = map[d.alloca];
+            try f.dbg_allocas.append(e.dm.allocator(), x);
+        }
+        e.dbg_allocas.clearRetainingCapacity();
         zf.end();
         if (e.optimize) {
             try promote.run(e.arena, &e.dm, func, &ranges);
@@ -2000,6 +2325,23 @@ const Emitter = struct {
         if (e.optimize and args.len > 0) frame.copies = try e.paramCopies(fi);
         if (e.optimize) frame.regs = try e.regsLocals(fi);
         if (e.optimize) frame.buf_locals = try e.bufLocals(fi);
+        // Debug information: the body is inlined at the call being
+        // lowered; what the call itself still adds is at the call again.
+        if (e.dbg != null) {
+            frame.no_dbg = fi == e.entry.wrapper or fi == e.entry.patch_wrapper;
+            frame.inlined_at = e.cur_dbg;
+            if (e.cur_dbg != 0) _ = try e.dm.dbgLocMd(e.cur_dbg);
+        }
+        const call_dbg = e.cur_dbg;
+        defer e.cur_dbg = call_dbg;
+        // Variables are described where promotion is all that follows
+        // (-Od): the other passes do not carry their values.
+        if (e.dbg != null and e.promote_only and !frame.no_dbg and f.vars.items.len > 0) {
+            const var_at = try e.arena.alloc(u32, f.insts.items.len);
+            @memset(var_at, 0);
+            for (f.vars.items, 1..) |v, k| var_at[v.storage.index()] = @intCast(k);
+            frame.var_at = var_at;
+        }
         const is_entry = e.cur == 0 and e.blocks.items[0].items.len == 0 and (fi == e.entry.wrapper or fi == e.entry.patch_wrapper);
         if (!is_entry) frame.cont = try e.newBlock();
         // The callee's entry continues the current block.
@@ -2490,8 +2832,11 @@ const Emitter = struct {
         const f = frame.f;
         const blk = f.blocks.items[bi];
         for (blk.insts.items) |r| {
+            if (e.dbg != null) e.cur_dbg = try e.dbgFor(frame, f.locOf(r));
             frame.vals[r.index()] = try e.emitInst(frame, r);
+            if (frame.var_at.len > 0 and frame.var_at[r.index()] != 0) try e.dbgVariable(frame, frame.var_at[r.index()] - 1, frame.vals[r.index()]);
         }
+        if (e.dbg != null) e.cur_dbg = try e.dbgFor(frame, blk.term_loc);
         const void_ty = try e.voidTy();
         switch (blk.term) {
             .ret => |v| {
@@ -8201,6 +8546,14 @@ const Emitter = struct {
         try dm.addNamedMetadata("dx.entryPoints", &.{entry_md});
         try promote.pruneGlobals(e.arena, dm);
         _ = try promote.pruneDeclarations(e.arena, dm);
+        // The debug module first: the same module, with its positions and
+        // debug metadata.
+        if (e.dbg != null) {
+            try e.dbgFinish();
+            const bytes = try dm.writeBitcodeDebug(dm.arena.child);
+            defer dm.arena.child.free(bytes);
+            e.debug_bitcode = try e.arena.dupe(u8, bytes);
+        }
         return dm.writeBitcode(dm.arena.child);
     }
 
@@ -8384,6 +8737,42 @@ const Emitter = struct {
         if (entry.root_signature) |text| if (!e.m.strip_rootsig) {
             try parts.append(e.arena, .{ .fourcc = container.fourcc("RTS0"), .data = try e.compileRootSignature(text, .global) });
         };
+        if (e.dbg) |dbg| {
+            // The shader's hash is of its code alone (as dxc's default,
+            // -Zsb): the same with and without debug information.
+            var digest: [16]u8 = undefined;
+            std.crypto.hash.Md5.hash(bitcode, &digest, .{});
+            const hex = std.fmt.bytesToHex(digest, .lower);
+            var dir: []const u8 = "";
+            var name: []const u8 = try std.fmt.allocPrint(e.arena, "{s}.pdb", .{&hex});
+            if (dbg.pdb_name) |given| {
+                if (given.len > 0 and (given[given.len - 1] == '/' or given[given.len - 1] == '\\')) dir = given else name = given;
+            }
+            name = try std.mem.concat(e.arena, u8, &.{ dir, name });
+            // ILDN: flags, the name's length, the name, zeros to the next
+            // four bytes (one at least).
+            const ildn = try e.arena.alloc(u8, std.mem.alignForward(usize, 4 + name.len + 1, 4));
+            @memset(ildn, 0);
+            std.mem.writeInt(u16, ildn[2..4], @intCast(name.len), .little);
+            @memcpy(ildn[4..][0..name.len], name);
+            // HASH: flags (0: not of the source), the digest.
+            const hash_part = try e.arena.alloc(u8, 20);
+            @memset(hash_part[0..4], 0);
+            @memcpy(hash_part[4..], &digest);
+            const ildb = try shader.programPart(e.arena, e.profile, e.debug_bitcode.?);
+            if (dbg.embed) try parts.append(e.arena, .{ .fourcc = container.fourcc("ILDB"), .data = ildb });
+            try parts.append(e.arena, .{ .fourcc = container.fourcc("ILDN"), .data = ildn });
+            try parts.append(e.arena, .{ .fourcc = container.fourcc("HASH"), .data = hash_part });
+            if (dbg.pdb) {
+                const inner = try container.assemble(e.arena, &.{
+                    .{ .fourcc = container.fourcc("ILDN"), .data = ildn },
+                    .{ .fourcc = container.fourcc("HASH"), .data = hash_part },
+                    .{ .fourcc = container.fourcc("ILDB"), .data = ildb },
+                });
+                e.pdb_name = try gpa.dupe(u8, name);
+                e.pdb = try pdb.write(gpa, inner, digest);
+            }
+        }
         try parts.append(e.arena, .{ .fourcc = container.fourcc("DXIL"), .data = dxil_part });
         // Last, as Unreal's dxc writes it: { 'SFI0', (padding), the
         // optional feature info: OptFeatureInfo_UsesDerivatives (bit 40)

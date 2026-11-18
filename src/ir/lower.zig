@@ -26,6 +26,8 @@ const BlockId = ir.BlockId;
 pub const Options = struct {
     entry: []const u8,
     stage: ir.Stage,
+    /// Debug information to carry in the module.
+    debug: ir.DebugLevel = .none,
 };
 
 pub const Error = Allocator.Error || error{Unsupported};
@@ -33,7 +35,7 @@ pub const Error = Allocator.Error || error{Unsupported};
 /// Lowers the entry point and what it reaches. Constructs the lowering does
 /// not handle yet fail with `error.Unsupported` after reporting why.
 pub fn lowerUnit(arena: Allocator, s: *Sema, opts: Options) Error!ir.Module {
-    var l: Lowerer = .{ .arena = arena, .s = s, .m = .{ .arena = arena, .types = &s.types } };
+    var l: Lowerer = .{ .arena = arena, .s = s, .m = .{ .arena = arena, .types = &s.types, .debug = opts.debug } };
     if (opts.stage == .library) {
         // Every function with a shader attribute, in declaration order.
         for (s.all_functions.items) |f| {
@@ -443,6 +445,7 @@ const Lowerer = struct {
             return error.Unsupported;
         };
         l.b = .{ .m = &l.m, .f = func };
+        if (func.debug) l.b.loc = .{ .loc = f.loc, .scope = try l.m.addScope(.{ .parent = .none, .func = l.funcs.get(f).?, .loc = f.loc }) };
         l.vars = .empty;
         l.loops = .empty;
         l.ret_ty = f.ret;
@@ -471,7 +474,10 @@ const Lowerer = struct {
                 try l.b.store(local, pv);
                 break :blk local;
             };
-            if (i < f.param_vars.len) if (f.param_vars[i]) |v| try l.vars.put(l.arena, v, storage);
+            if (i < f.param_vars.len) if (f.param_vars[i]) |v| {
+                try l.vars.put(l.arena, v, storage);
+                try l.debugVar(storage, v, @intCast(i + 1));
+            };
         }
         try l.stmts(body.kind.compound);
         if (l.b.open()) {
@@ -557,7 +563,22 @@ const Lowerer = struct {
         for (list) |st| try l.stmt(st);
     }
 
+    /// Debug information: `storage` holds the source variable `v`
+    /// (parameter `arg`, from 1; 0 for a local).
+    fn debugVar(l: *Lowerer, storage: Ref, v: *const Variable, arg: u32) Error!void {
+        if (l.m.debug != .full) return;
+        try l.b.f.vars.append(l.arena, .{ .storage = storage, .name = v.name, .ty = v.type, .loc = v.loc, .scope = l.b.loc.scope, .arg = arg });
+    }
+
     fn stmt(l: *Lowerer, st: *const ast.Stmt) Error!void {
+        // Debug information: the statement's position, and a scope for
+        // the declarations of a block or a `for`.
+        l.b.loc.loc = st.loc;
+        const scope = l.b.loc.scope;
+        defer l.b.loc.scope = scope;
+        if (scope != .none and (st.kind == .compound or st.kind == .@"for")) {
+            l.b.loc.scope = try l.m.addScope(.{ .parent = scope, .func = l.m.scopes.items[scope.index()].func, .loc = st.loc });
+        }
         switch (st.kind) {
             .compound => |list| try l.stmts(list),
             .empty => {},
@@ -748,6 +769,7 @@ const Lowerer = struct {
                 }
                 const local = try l.b.add(.{ .op = .local_var, .ty = variable.type, .ptr = .function });
                 try l.vars.put(l.arena, variable, local);
+                try l.debugVar(local, variable, 0);
                 if (v.init) |init_e| {
                     if (init_e.kind == .init_list) {
                         const val = try l.initList(init_e, variable.type);
@@ -988,6 +1010,11 @@ const Lowerer = struct {
     }
 
     fn rvalue(l: *Lowerer, e: *ast.Expr) Error!Ref {
+        // Debug information: instructions take the position of the
+        // expression they compute.
+        const outer_loc = l.b.loc.loc;
+        l.b.loc.loc = e.loc;
+        defer l.b.loc.loc = outer_loc;
         const t = l.types();
         switch (e.kind) {
             .binary, .unary, .index, .assign => if (l.s.resolution(e)) |r| if (r == .function) return l.operatorCall(e, r.function),
@@ -1980,6 +2007,9 @@ const Lowerer = struct {
     }
 
     fn lvalue(l: *Lowerer, e: *ast.Expr) Error!Ref {
+        const outer_loc = l.b.loc.loc;
+        l.b.loc.loc = e.loc;
+        defer l.b.loc.loc = outer_loc;
         if (l.s.resolution(e)) |r| if (r == .node_record) return l.nodeRecordPtr(e);
         const t = l.types();
         // A resource inside a global struct: its own global.
@@ -2613,6 +2643,7 @@ const Lowerer = struct {
         try l.drain();
         const wrapper = try l.m.addFunction(.{ .name = try std.fmt.allocPrint(l.arena, "{s}.wrapper", .{name}), .params = &.{}, .ret = TypeTable.void_type, .entry = l.cur_entry });
         l.b = .{ .m = &l.m, .f = l.m.functions.items[wrapper] };
+        if (l.m.debug != .none) l.b.loc = .{ .loc = pcf.loc, .scope = try l.m.addScope(.{ .parent = .none, .func = wrapper, .loc = pcf.loc }) };
         l.b.setBlock(try l.b.newBlock());
         const args = try l.arena.alloc(Ref, pcf.params.len);
         const locals = try l.arena.alloc(Ref, pcf.params.len);
@@ -2760,6 +2791,7 @@ const Lowerer = struct {
         };
         const wrapper = try l.m.addFunction(.{ .name = opts.entry, .params = &.{}, .ret = TypeTable.void_type, .entry = l.cur_entry });
         l.b = .{ .m = &l.m, .f = l.m.functions.items[wrapper] };
+        if (l.m.debug != .none) l.b.loc = .{ .loc = f.loc, .scope = try l.m.addScope(.{ .parent = .none, .func = wrapper, .loc = f.loc }) };
         l.b.setBlock(try l.b.newBlock());
         for (l.s.static_globals.items) |v| if (inits.get(v)) |fi| {
             const g = l.globals.get(v).?;

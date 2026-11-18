@@ -298,6 +298,7 @@ pub fn run(a: Allocator, f: *ir.Function) Allocator.Error!bool {
         }
     }
     if (!any) return false;
+    f.mapDebugValues(mp);
     // Phis (whose operands may come from later blocks) and terminators,
     // of reachable blocks only.
     for (rpo.items) |b| {

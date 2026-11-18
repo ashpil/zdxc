@@ -26,6 +26,7 @@ pub const dxil = struct {
     pub const container = @import("dxil/container.zig");
     pub const hash = @import("dxil/hash.zig");
     pub const module = @import("dxil/module.zig");
+    pub const pdb = @import("dxil/pdb.zig");
     pub const shader = @import("dxil/shader.zig");
     pub const signature = @import("dxil/signature.zig");
     pub const emit = @import("dxil/emit.zig");

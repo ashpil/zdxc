@@ -21,6 +21,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const types = @import("../sema/types.zig");
+const source = @import("../front/source.zig");
 
 pub const TypeId = types.TypeId;
 pub const TypeTable = types.TypeTable;
@@ -42,6 +43,99 @@ pub const BlockId = enum(u32) {
     pub fn index(b: BlockId) u32 {
         return @backingInt(b);
     }
+};
+
+/// How much debug information the module carries (`Module.debug`):
+/// `line` is a position per instruction, `full` adds the variables.
+pub const DebugLevel = enum { none, line, full };
+
+/// A function body or a block inside one (`Module.scopes`).
+pub const ScopeId = enum(u32) {
+    none = std.math.maxInt(u32),
+    _,
+
+    pub fn index(s: ScopeId) u32 {
+        return @backingInt(s);
+    }
+};
+
+pub const Scope = struct {
+    /// `.none`: the function's own scope.
+    parent: ScopeId,
+    /// The function the scope was lowered in (index into
+    /// `Module.functions`); inlining does not change it.
+    func: u32,
+    /// Where the function or block starts.
+    loc: source.Loc,
+};
+
+/// A call that was inlined (`Module.inline_sites`): where it was, and the
+/// call the caller itself was inlined at.
+pub const InlineId = enum(u32) {
+    none = std.math.maxInt(u32),
+    _,
+
+    pub fn index(s: InlineId) u32 {
+        return @backingInt(s);
+    }
+};
+
+pub const InlineSite = struct {
+    loc: source.Loc,
+    scope: ScopeId,
+    inlined_at: InlineId,
+};
+
+/// Where an instruction came from: a source position, the scope it is in
+/// and, in an inlined copy, the call it was inlined at.
+pub const DebugLoc = struct {
+    loc: source.Loc = .none,
+    scope: ScopeId = .none,
+    inlined_at: InlineId = .none,
+
+    pub const none: DebugLoc = .{};
+};
+
+/// A source variable and the storage that holds it (`Function.vars`).
+pub const DebugVar = struct {
+    /// A `local_var`, or the `param` of an out / inout parameter.
+    storage: Ref,
+    name: []const u8,
+    /// The HLSL type.
+    ty: TypeId,
+    loc: source.Loc,
+    scope: ScopeId,
+    inlined_at: InlineId = .none,
+    /// Parameters: the position, from 1 (0: a local).
+    arg: u32 = 0,
+};
+
+/// A value a promoted source variable, or one member of it, takes
+/// (`Function.dbg_values`): from where `before` is in its block, or from
+/// the end of `block` (`before` is `.none`).
+pub const DebugValue = struct {
+    before: Ref = .none,
+    block: BlockId,
+    /// Index into `Function.vars`.
+    variable: u32,
+    /// The member: indices from the variable's type.
+    path: []const u32 = &.{},
+    value: Ref,
+    /// Where it was assigned.
+    loc: source.Loc = .none,
+    /// The block's instructions when the value was recorded, and where in
+    /// them it was (before `ctx[pos]`): what `Function.settleDebugValues`
+    /// finds its place from after later passes.
+    ctx: []const Ref = &.{},
+    pos: u32 = 0,
+};
+
+/// A local that holds one member of a variable since scalar replacement
+/// (`Function.var_parts`).
+pub const DebugPart = struct {
+    storage: Ref,
+    variable: u32,
+    path: []const u32,
 };
 
 /// Where a pointer points.
@@ -201,6 +295,8 @@ pub const Unroll = enum { auto, unroll, dont };
 pub const Block = struct {
     insts: std.ArrayList(Ref) = .empty,
     term: Terminator = .none,
+    /// The terminator's position (debug information).
+    term_loc: DebugLoc = .none,
     merge: Merge = .none,
     /// `[flatten]` / `[branch]` on the selection this block heads.
     selection_control: SelectionControl = .none,
@@ -241,9 +337,105 @@ pub const Function = struct {
     dead: bool = false,
     insts: std.ArrayList(Inst) = .empty,
     blocks: std.ArrayList(Block) = .empty,
+    /// Debug information (`Module.debug` is not `none`): each
+    /// instruction's position, by instruction index (instructions past
+    /// its end have none), and the source variables.
+    debug: bool = false,
+    locs: std.ArrayList(DebugLoc) = .empty,
+    vars: std.ArrayList(DebugVar) = .empty,
+    /// What `ssa.zig` leaves of the variables it replaces.
+    var_parts: std.ArrayList(DebugPart) = .empty,
+    dbg_values: std.ArrayList(DebugValue) = .empty,
+    /// The position `appendInst` gives new instructions: a pass sets it
+    /// to the position of the instruction it is rewriting.
+    cur_loc: DebugLoc = .none,
 
     pub fn inst(f: *const Function, r: Ref) Inst {
         return f.insts.items[r.index()];
+    }
+
+    /// After a pass replaced values: the variables that held them hold
+    /// what `mp.map` gives.
+    pub fn mapDebugValues(f: *Function, mp: anytype) void {
+        for (f.dbg_values.items) |*dv| dv.value = mp.map(dv.value);
+    }
+
+    /// After the passes that follow promotion (which remove, merge and
+    /// replace instructions without regard for `dbg_values`): each value
+    /// is where the nearest instruction left of those it was among is,
+    /// and the values that are gone (dead code keeps nothing for debug
+    /// information; a constant or a parameter needs no instruction) are
+    /// dropped.
+    pub fn settleDebugValues(f: *Function, a: Allocator) Allocator.Error!void {
+        if (f.dbg_values.items.len == 0) return;
+        const none = std.math.maxInt(u32);
+        const Place = struct { block: u32, at: u32 };
+        const place = try a.alloc(Place, f.insts.items.len);
+        @memset(place, .{ .block = none, .at = 0 });
+        for (f.blocks.items, 0..) |blk, bi| for (blk.insts.items, 0..) |r, k| {
+            place[r.index()] = .{ .block = @intCast(bi), .at = @intCast(k) };
+        };
+        var n: usize = 0;
+        for (f.dbg_values.items) |dv| {
+            // (What the emitters make before any block.)
+            const constant = switch (f.inst(dv.value).op) {
+                .constant, .param, .undef => true,
+                else => false,
+            };
+            const def = place[dv.value.index()];
+            if (!constant and def.block == none) continue;
+            var blk: u32 = none;
+            var at: u32 = 0;
+            const pos = @min(dv.pos, dv.ctx.len);
+            for (dv.ctx[pos..]) |r| {
+                const p = place[r.index()];
+                if (p.block == none) continue;
+                blk = p.block;
+                at = p.at;
+                break;
+            }
+            var k = pos;
+            while (blk == none and k > 0) {
+                k -= 1;
+                const p = place[dv.ctx[k].index()];
+                if (p.block == none) continue;
+                blk = p.block;
+                at = p.at + 1;
+            }
+            if (blk == none) {
+                // Nothing left of its block: where the value is made.
+                if (def.block == none) continue;
+                blk = def.block;
+                at = def.at + 1;
+            }
+            if (def.block == blk and at <= def.at) at = def.at + 1;
+            const insts = f.blocks.items[blk].insts.items;
+            while (at < insts.len and f.inst(insts[at]).op == .phi) at += 1;
+            var x = dv;
+            x.block = @fromBackingInt(blk);
+            x.before = if (at < insts.len) insts[at] else .none;
+            f.dbg_values.items[n] = x;
+            n += 1;
+        }
+        f.dbg_values.shrinkRetainingCapacity(n);
+    }
+
+    pub fn locOf(f: *const Function, r: Ref) DebugLoc {
+        return if (r.index() < f.locs.items.len) f.locs.items[r.index()] else .none;
+    }
+
+    pub fn setLoc(f: *Function, a: Allocator, r: Ref, loc: DebugLoc) Allocator.Error!void {
+        if (!f.debug) return;
+        if (r.index() >= f.locs.items.len) try f.locs.appendNTimes(a, .none, r.index() + 1 - f.locs.items.len);
+        f.locs.items[r.index()] = loc;
+    }
+
+    /// A new instruction (in no block yet) at `cur_loc`.
+    pub fn appendInst(f: *Function, a: Allocator, i: Inst) Allocator.Error!Ref {
+        try f.insts.append(a, i);
+        const r: Ref = @fromBackingInt(@intCast(f.insts.items.len - 1));
+        if (f.debug) try f.setLoc(a, r, f.cur_loc);
+        return r;
     }
 
     pub fn block(f: *Function, b: BlockId) *Block {
@@ -638,12 +830,28 @@ pub const Module = struct {
     /// -Qstrip_rootsignature.
     rootsig_version: enum { v1_0, v1_1 } = .v1_1,
     strip_rootsig: bool = false,
+    /// Debug information: none unless asked for. Instructions then have
+    /// positions (`Function.locs`) in these scopes and inlined calls.
+    debug: DebugLevel = .none,
+    scopes: std.ArrayList(Scope) = .empty,
+    inline_sites: std.ArrayList(InlineSite) = .empty,
 
     pub fn addFunction(m: *Module, f: Function) !u32 {
         const p = try m.arena.create(Function);
         p.* = f;
+        p.debug = m.debug != .none;
         try m.functions.append(m.arena, p);
         return @intCast(m.functions.items.len - 1);
+    }
+
+    pub fn addScope(m: *Module, s: Scope) !ScopeId {
+        try m.scopes.append(m.arena, s);
+        return @fromBackingInt(@intCast(m.scopes.items.len - 1));
+    }
+
+    pub fn addInlineSite(m: *Module, s: InlineSite) !InlineId {
+        try m.inline_sites.append(m.arena, s);
+        return @fromBackingInt(@intCast(m.inline_sites.items.len - 1));
     }
 };
 
@@ -652,6 +860,9 @@ pub const Builder = struct {
     m: *Module,
     f: *Function,
     cur: BlockId = .none,
+    /// The position of the instructions and terminators being added
+    /// (debug information).
+    loc: DebugLoc = .none,
 
     pub fn newBlock(b: *Builder) !BlockId {
         try b.f.blocks.append(b.m.arena, .{});
@@ -673,6 +884,7 @@ pub const Builder = struct {
         if (x.ptr == .none) x.ty = b.m.types.canonical(x.ty);
         try b.f.insts.append(b.m.arena, x);
         const r: Ref = @fromBackingInt(@intCast(b.f.insts.items.len - 1));
+        if (b.f.debug) try b.f.setLoc(b.m.arena, r, b.loc);
         // Instructions after a terminator (dead code) go to a fresh block.
         if (!b.open()) b.cur = try b.newBlock();
         try b.f.block(b.cur).insts.append(b.m.arena, r);
@@ -682,6 +894,7 @@ pub const Builder = struct {
     pub fn terminate(b: *Builder, t: Terminator) void {
         if (!b.open()) return;
         b.f.block(b.cur).term = t;
+        b.f.block(b.cur).term_loc = b.loc;
     }
 
     pub fn constInt(b: *Builder, ty: TypeId, v: i64) !Ref {
@@ -721,6 +934,12 @@ pub fn verify(m: *const Module) void {
 
 /// Prints a module in a readable text form (for `-zdxc-ir` and tests).
 pub fn dump(m: *const Module, w: *std.Io.Writer) !void {
+    return dumpWith(m, w, null);
+}
+
+/// As `dump`; with `sm`, each instruction that has a position is followed
+/// by `; file:line:col`, its scope and the calls it was inlined at.
+pub fn dumpWith(m: *const Module, w: *std.Io.Writer, sm: ?*const source.SourceManager) !void {
     for (m.globals.items, 0..) |g, i| {
         try w.print("global @{d} {s}: {s} {s}", .{ i, g.name, @tagName(g.space), try m.types.format(m.arena, g.ty) });
         if (g.binding.class != 0) try w.print(" : register({c}{d}, space{d})", .{ g.binding.class, g.binding.index, g.binding.space });
@@ -733,6 +952,12 @@ pub fn dump(m: *const Module, w: *std.Io.Writer) !void {
             try w.print("{s}{s}: {s}", .{ if (p.by_ref) "ref " else "", p.name, try m.types.format(m.arena, p.ty) });
         }
         try w.print(") -> {s} {{\n", .{try m.types.format(m.arena, f.ret)});
+        if (sm != null) for (f.vars.items) |v| {
+            try w.print("  ; var {s}: {s} = %{d}", .{ v.name, try m.types.format(m.arena, v.ty), v.storage.index() });
+            if (v.arg != 0) try w.print(" arg {d}", .{v.arg});
+            try dumpLoc(m, .{ .loc = v.loc, .scope = v.scope, .inlined_at = v.inlined_at }, w, sm.?);
+            try w.writeByte('\n');
+        };
         for (f.blocks.items, 0..) |blk, bi| {
             try w.print("b{d}:", .{bi});
             switch (blk.merge) {
@@ -741,7 +966,11 @@ pub fn dump(m: *const Module, w: *std.Io.Writer) !void {
                 .loop => |l| try w.print("  ; loop merge b{d} continue b{d}", .{ l.merge.index(), l.@"continue".index() }),
             }
             try w.writeByte('\n');
-            for (blk.insts.items) |r| try dumpInst(m, f, r, w);
+            for (blk.insts.items) |r| {
+                try dumpInst(m, f, r, w);
+                if (sm) |x| try dumpLoc(m, f.locOf(r), w, x);
+                try w.writeByte('\n');
+            }
             try w.writeAll("  ");
             switch (blk.term) {
                 .none => try w.writeAll("<open>"),
@@ -755,6 +984,7 @@ pub fn dump(m: *const Module, w: *std.Io.Writer) !void {
                 .@"unreachable" => try w.writeAll("unreachable"),
                 .discard => try w.writeAll("discard"),
             }
+            if (sm) |x| try dumpLoc(m, blk.term_loc, w, x);
             try w.writeByte('\n');
         }
         try w.writeAll("}\n");
@@ -835,5 +1065,25 @@ fn dumpInst(m: *const Module, f: *const Function, r: Ref, w: *std.Io.Writer) !vo
             for (ins, 0..) |in, i| try w.print("{s} [%{d}, b{d}]", .{ if (i > 0) "," else "", in.value.index(), in.block.index() });
         },
     }
-    try w.writeByte('\n');
+}
+
+fn dumpLoc(m: *const Module, d: DebugLoc, w: *std.Io.Writer, sm: *const source.SourceManager) !void {
+    if (d.loc.isNone()) return;
+    try w.writeAll("  ; ");
+    try dumpPos(d.loc, w, sm);
+    if (d.scope != .none) try w.print(" s{d}", .{d.scope.index()});
+    var at = d.inlined_at;
+    while (at != .none) {
+        const site = m.inline_sites.items[at.index()];
+        try w.writeAll(" @ ");
+        try dumpPos(site.loc, w, sm);
+        at = site.inlined_at;
+    }
+}
+
+fn dumpPos(loc: source.Loc, w: *std.Io.Writer, sm: *const source.SourceManager) !void {
+    if (loc.isNone()) return w.writeAll("?");
+    const lc = sm.lineCol(loc);
+    const p = sm.presumedLoc(loc);
+    try w.print("{s}:{d}:{d}", .{ std.fs.path.basename(p.file), p.line, lc.col });
 }

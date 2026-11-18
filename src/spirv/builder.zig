@@ -9,7 +9,11 @@ pub const Id = u32;
 /// SPIR-V opcodes (unified1 core grammar numbering).
 pub const Op = enum(u16) {
     undef = 1,
+    source_continued = 2,
     source = 3,
+    line = 8,
+    no_line = 317,
+    module_processed = 330,
     string = 7,
     name = 5,
     member_name = 6,
@@ -263,6 +267,8 @@ pub const Section = enum {
     /// OpString (before OpSource and the names).
     debug_strings,
     debug_names,
+    /// OpModuleProcessed (after the names).
+    debug_processed,
     annotations,
     types_globals,
     functions,
@@ -272,9 +278,78 @@ pub const Builder = struct {
     gpa: Allocator,
     sections: std.EnumArray(Section, std.ArrayList(u32)) = .initFill(.empty),
     next_id: Id = 1,
+    /// Debug lines: the position (file OpString, line, column; `no_line`
+    /// for none) of what is being emitted into `functions`, and the one
+    /// in effect in the block. An OpLine or OpNoLine is written before the
+    /// next instruction when they differ.
+    line: [3]u32 = no_line,
+    line_cur: [3]u32 = no_line,
+    /// NonSemantic.Shader.DebugInfo.100: lines are DebugLine (`line` is
+    /// the DebugSource and the constants of line and column), and a
+    /// DebugScope is kept the same way (`scope`: the scope and its
+    /// DebugInlinedAt, 0 for none).
+    ext: ?struct { void_ty: Id, set: Id } = null,
+    scope: [2]u32 = .{ 0, 0 },
+    scope_cur: [2]u32 = .{ 0, 0 },
+
+    pub const no_line: [3]u32 = .{ 0, 0, 0 };
 
     pub fn init(gpa: Allocator) Builder {
         return .{ .gpa = gpa };
+    }
+
+    /// Before `op` goes into `functions`: the OpLine or OpNoLine it needs.
+    /// (A merge instruction takes the line of the branch after it: nothing
+    /// may come between them.)
+    fn lineFor(b: *Builder, op: Op) !void {
+        switch (op) {
+            // The line in effect ends with the block.
+            .label => {
+                b.line_cur = no_line;
+                b.scope_cur = .{ 0, 0 };
+                return;
+            },
+            .function, .function_parameter, .function_end => return,
+            // (Only OpLine may come before a phi.)
+            .phi => if (b.ext != null) return,
+            else => {},
+        }
+        try b.flushLine();
+    }
+
+    fn extInst(b: *Builder, inst: u32, operands: []const u32) !void {
+        const s = b.sections.getPtr(.functions);
+        const x = b.ext.?;
+        try s.appendSlice(b.gpa, &.{ (@as(u32, @intCast(5 + operands.len)) << 16) | @as(u32, @backingInt(Op.ext_inst)), x.void_ty, b.newId(), x.set, inst });
+        try s.appendSlice(b.gpa, operands);
+    }
+
+    /// Writes the OpLine or OpNoLine now, for an emitter that is about to
+    /// record a position in `functions`.
+    pub fn flushLine(b: *Builder) !void {
+        if (b.ext != null) {
+            if (!std.mem.eql(u32, &b.scope, &b.scope_cur)) {
+                if (b.scope[0] == 0) {
+                    try b.extInst(24, &.{}); // DebugNoScope
+                } else if (b.scope[1] == 0) {
+                    try b.extInst(23, b.scope[0..1]); // DebugScope
+                } else try b.extInst(23, &b.scope);
+                b.scope_cur = b.scope;
+            }
+            if (std.mem.eql(u32, &b.line, &b.line_cur)) return;
+            if (b.line[0] != 0) {
+                try b.extInst(103, &.{ b.line[0], b.line[1], b.line[1], b.line[2], b.line[2] }); // DebugLine
+            } else try b.extInst(104, &.{}); // DebugNoLine
+            b.line_cur = b.line;
+            return;
+        }
+        if (std.mem.eql(u32, &b.line, &b.line_cur)) return;
+        const s = b.sections.getPtr(.functions);
+        if (b.line[0] != 0) {
+            try s.append(b.gpa, (4 << 16) | @as(u32, @backingInt(Op.line)));
+            try s.appendSlice(b.gpa, &b.line);
+        } else try s.append(b.gpa, (1 << 16) | @as(u32, @backingInt(Op.no_line)));
+        b.line_cur = b.line;
     }
 
     pub fn deinit(b: *Builder) void {
@@ -288,6 +363,7 @@ pub const Builder = struct {
 
     /// Emit an instruction; `operands` are raw words.
     pub fn emit(b: *Builder, section: Section, op: Op, operands: []const u32) !void {
+        if (section == .functions) try b.lineFor(op);
         const s = b.sections.getPtr(section);
         const count: u32 = @intCast(operands.len + 1);
         try s.append(b.gpa, (count << 16) | @backingInt(op));

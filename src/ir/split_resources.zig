@@ -161,8 +161,7 @@ const Pass = struct {
     fn add(p: *Pass, f: *ir.Function, inst: ir.Inst) Allocator.Error!Ref {
         var x = inst;
         if (x.ptr == .none) x.ty = p.t.canonical(x.ty);
-        try f.insts.append(p.a, x);
-        return @enumFromInt(f.insts.items.len - 1);
+        return f.appendInst(p.a, x);
     }
 
     fn leafParam(p: *Pass, f: *ir.Function, r: Ref, old: ir.Inst, ty: TypeId, pi: u32, first: u32, out: *std.ArrayList(Ref), leaves: *std.AutoHashMapUnmanaged(Ref, []const Ref), pleaves: *std.AutoHashMapUnmanaged(Ref, []const Ref)) Error!void {
@@ -222,6 +221,8 @@ const Pass = struct {
             var out: std.ArrayList(Ref) = .empty;
             for (blk.insts.items) |r| {
                 const old = f.insts.items[r.index()];
+                f.cur_loc = f.locOf(r);
+                defer f.cur_loc = .none;
                 const op = try opt.mapOp(p.a, old.op, mp);
                 f.insts.items[r.index()].op = op;
                 const ty = old.ty;
@@ -441,7 +442,7 @@ const Pass = struct {
             var seen = false;
             for (f.insts.items, 0..) |inst, ii| {
                 if (inst.op != .store or inst.op.store.ptr != kv.value_ptr.*) continue;
-                if (ref_init.contains(@enumFromInt(ii))) continue;
+                if (ref_init.contains(@fromBackingInt(@intCast(ii)))) continue;
                 const here = p.trace(f, inst.op.store.value) orelse return p.fail("passing out a resource that is not a parameter or global", .{});
                 if (seen and !std.meta.eql(src.?, here)) return p.fail("passing out different resources from one function", .{});
                 src = here;
