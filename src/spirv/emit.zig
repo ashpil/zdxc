@@ -269,6 +269,8 @@ const Emitter = struct {
     cur_bindings: []const Id = &.{},
     /// Their types (bindingType; 0 for other parameters).
     cur_binding_types: []const TypeId = &.{},
+    /// firstStores' results.
+    first_stores: std.AutoHashMapUnmanaged(*const ir.Function, FirstStores) = .empty,
     /// Per instruction (current function): resource locals assigned
     /// elements of one resource array, kept as their indices.
     indexed_locals: std.AutoHashMapUnmanaged(u32, IndexedLocal) = .empty,
@@ -1658,13 +1660,13 @@ const Emitter = struct {
     fn findCounterGlobals(e: *Emitter) Error!void {
         const Origin = union(enum) { global: u32, param: struct { *const ir.Function, u32 }, none };
         const origin = struct {
-            fn f(func: *const ir.Function, r: Ref) Origin {
+            fn f(em: *Emitter, func: *const ir.Function, r: Ref) Origin {
                 var x = r;
                 var steps: usize = 0;
                 while (true) : (steps += 1) switch (func.inst(x).op) {
                     .load => |p| x = p,
                     .access => |a| x = a.base,
-                    .local_var => x = (if (steps < max_resource_steps) storedResource(func, x) else null) orelse return .none,
+                    .local_var => x = (if (steps < max_resource_steps) em.storedResource(func, x) else null) orelse return .none,
                     .global => |g| return .{ .global = g },
                     .param => |p| return .{ .param = .{ func, p } },
                     else => return .none,
@@ -1693,7 +1695,7 @@ const Emitter = struct {
             .method => |mt| {
                 const eq = std.mem.eql;
                 if (!eq(u8, mt.name, "IncrementCounter") and !eq(u8, mt.name, "DecrementCounter") and !eq(u8, mt.name, "Append") and !eq(u8, mt.name, "Consume")) continue;
-                _ = try mark(e, &params, origin(f, mt.res));
+                _ = try mark(e, &params, origin(e, f, mt.res));
             },
             else => {},
         };
@@ -1705,7 +1707,7 @@ const Emitter = struct {
                     const callee = e.m.functions.items[c.func];
                     for (c.args, 0..) |a, k| {
                         if (!params.contains(.{ callee, @intCast(k) })) continue;
-                        if (try mark(e, &params, origin(f, a))) changed = true;
+                        if (try mark(e, &params, origin(e, f, a))) changed = true;
                     }
                 },
                 else => {},
@@ -1733,7 +1735,7 @@ const Emitter = struct {
             },
             // A resource local (Unreal's `static const` bindless handles):
             // the resource stored into it.
-            .local_var => x = (if (steps < max_resource_steps) storedResource(e.f, x) else null) orelse break,
+            .local_var => x = (if (steps < max_resource_steps) e.storedResource(e.f, x) else null) orelse break,
             else => break,
         };
         const g = e.globalOf(x) orelse return e.unsupported("counters of resources not tied to a global are not supported yet", .{});
@@ -2089,7 +2091,7 @@ const Emitter = struct {
                 x = p;
             },
             // A resource local: what was stored into it.
-            .local_var => x = (if (steps < max_resource_steps) storedResource(f, x) else null) orelse return .{ .id = e.val(x) },
+            .local_var => x = (if (steps < max_resource_steps) e.storedResource(f, x) else null) orelse return .{ .id = e.val(x) },
             else => break,
         };
         switch (f.inst(x).op) {
@@ -3262,8 +3264,8 @@ const Emitter = struct {
     /// resource locals (each followed to what was stored into it).
     fn sameResource(e: *Emitter, f: *const ir.Function, x0: Ref, y0: Ref, depth: u32) bool {
         if (depth > 64) return false;
-        const x = resolveResourceLocal(f, x0);
-        const y = resolveResourceLocal(f, y0);
+        const x = e.resolveResourceLocal(f, x0);
+        const y = e.resolveResourceLocal(f, y0);
         if (x == y) return true;
         if (x == .none or y == .none) return false;
         const a = f.inst(x);
@@ -3292,7 +3294,7 @@ const Emitter = struct {
 
     /// A resource local, or a load of one, as the value stored into it
     /// (through any number of copies).
-    fn resolveResourceLocal(f: *const ir.Function, r: Ref) Ref {
+    fn resolveResourceLocal(e: *Emitter, f: *const ir.Function, r: Ref) Ref {
         var x = r;
         var steps: usize = 0;
         while (x != .none and steps < max_resource_steps) : (steps += 1) {
@@ -3302,7 +3304,7 @@ const Emitter = struct {
                 .load => |p| if (f.inst(p).op == .local_var and f.inst(p).ptr == .function) p else return x,
                 else => return x,
             };
-            x = storedResource(f, local) orelse return x;
+            x = e.storedResource(f, local) orelse return x;
         }
         return x;
     }
@@ -3312,10 +3314,19 @@ const Emitter = struct {
     /// other in a loop would never end).
     const max_resource_steps = 256;
 
+    const FirstStores = std.AutoHashMapUnmanaged(u32, Ref);
+
     /// The resource first stored into resource local `local`, leaving out
     /// stores of the local into itself (`r = r`), which do not say where
     /// it comes from.
-    fn storedResource(f: *const ir.Function, local: Ref) ?Ref {
+    /// (Asked once per use of a resource: the answers for a function's
+    /// locals are found together, in one pass over it.)
+    fn storedResource(e: *Emitter, f: *const ir.Function, local: Ref) ?Ref {
+        const stores = e.firstStores(f) catch return scanStoredResource(f, local);
+        return stores.get(local.index());
+    }
+
+    fn scanStoredResource(f: *const ir.Function, local: Ref) ?Ref {
         for (f.insts.items) |inst| {
             if (inst.op != .store or inst.op.store.ptr != local) continue;
             var v = inst.op.store.value;
@@ -3324,6 +3335,25 @@ const Emitter = struct {
             return inst.op.store.value;
         }
         return null;
+    }
+
+    /// Per local of `f`: the value of the first store into it that is not
+    /// of the local itself (storedResource's answer).
+    fn firstStores(e: *Emitter, f: *const ir.Function) Allocator.Error!*const FirstStores {
+        if (e.first_stores.getPtr(f)) |known| return known;
+        var stores: FirstStores = .empty;
+        for (f.insts.items) |inst| {
+            if (inst.op != .store) continue;
+            const local = inst.op.store.ptr;
+            if (f.inst(local).op != .local_var) continue;
+            var v = inst.op.store.value;
+            while (f.inst(v).op == .load) v = f.inst(v).op.load;
+            if (v == local) continue;
+            const slot = try stores.getOrPut(e.arena, local.index());
+            if (!slot.found_existing) slot.value_ptr.* = inst.op.store.value;
+        }
+        try e.first_stores.put(e.arena, f, stores);
+        return e.first_stores.getPtr(f).?;
     }
 
     /// The global a pointer derives from, if any.
@@ -4164,7 +4194,7 @@ const Emitter = struct {
                 if (e.indexed_loads.get(x.index())) |il| return elemType(e.t, f.inst(il.global).ty, il.indices.len);
                 x = p;
             },
-            .local_var => x = (if (steps < max_resource_steps) storedResource(f, x) else null) orelse return f.inst(x).ty,
+            .local_var => x = (if (steps < max_resource_steps) e.storedResource(f, x) else null) orelse return f.inst(x).ty,
             else => break,
         };
         return switch (f.inst(x).op) {
