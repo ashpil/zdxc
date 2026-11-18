@@ -202,7 +202,8 @@ pub fn mapOp(a: Allocator, op: Op, ctx: anytype) Allocator.Error!Op {
         .res_store => |x| .{ .res_store = .{ .res = ctx.map(x.res), .index = ctx.map(x.index), .value = ctx.map(x.value) } },
         .method => |x| .{ .method = .{ .name = x.name, .res = ctx.map(x.res), .args = try mapRefs(a, x.args, ctx) } },
         .output => |x| .{ .output = .{ .element = x.element, .value = ctx.map(x.value) } },
-        .heap_resource => |h| .{ .heap_resource = .{ .index = ctx.map(h.index), .sampler = h.sampler } },
+        .heap_resource => |h| .{ .heap_resource = .{ .index = ctx.map(h.index), .sampler = h.sampler, .decl = h.decl } },
+        .address => |x| .{ .address = .{ .addr = ctx.map(x.addr), .alignment = x.alignment } },
         .spirv_inst => |x| blk: {
             const ops = try a.dupe(@typeInfo(@TypeOf(x.operands)).pointer.child, x.operands);
             for (ops) |*o| switch (o.*) {
@@ -276,6 +277,7 @@ pub fn eachOperand(op: Op, ctx: anytype) void {
         },
         .output => |x| ctx.use(x.value),
         .heap_resource => |h| ctx.use(h.index),
+        .address => |x| ctx.use(x.addr),
         .spirv_inst => |x| for (x.operands) |o| switch (o) {
             .value => |v| ctx.use(v),
             .literal, .type, .string => {},
@@ -979,7 +981,7 @@ pub fn isPureIntrinsic(f: *const ir.Function, name: []const u8, args: []const Re
 
 fn isPureOp(f: *const ir.Function, op: Op) bool {
     return switch (op) {
-        .constant, .global, .load, .access, .binary, .unary, .cmp, .convert, .bitcast, .splat, .extract, .insert, .construct, .shuffle, .select, .heap_resource, .phi, .undef, .res_load => true,
+        .constant, .global, .load, .access, .address, .binary, .unary, .cmp, .convert, .bitcast, .splat, .extract, .insert, .construct, .shuffle, .select, .heap_resource, .phi, .undef, .res_load => true,
         .intrinsic => |x| isPureIntrinsic(f, x.name, x.args),
         // Texture reads (not the forms that write a status through a
         // pointer argument).

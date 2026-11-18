@@ -52,6 +52,13 @@ const Module = struct {
         return null;
     }
 
+    /// Whether member `member` of `id` is decorated with `d`.
+    fn memberDecorated(m: Module, id: u32, member: u32, d: u32) bool {
+        var it = m.ops();
+        while (it.next()) |i| if (i.op == 72 and i.args[0] == id and i.args[1] == member and i.args[2] == d) return true; // OpMemberDecorate
+        return false;
+    }
+
     /// The literal of decoration `deco` on `id` (0 for none), or null.
     fn deco(m: Module, id: u32, d: u32) ?u32 {
         var it = m.ops();
@@ -861,4 +868,454 @@ test "out arguments of atomics and sincos are values, not locals" {
     try expectEqual(@as(usize, 0), functionVars(m));
     try expectEqual(@as(usize, 1), countOp(m, 234)); // OpAtomicIAdd
     try expectEqual(@as(usize, 1), countOp(m, 230)); // OpAtomicCompareExchange
+}
+
+/// The Aligned literals of loads (OpLoad) or stores (OpStore) through
+/// PhysicalStorageBuffer pointers, in order.
+fn physicalAlignments(a: std.mem.Allocator, m: Module, op: u16) ![]const u32 {
+    var psb_ptrs: std.AutoHashMapUnmanaged(u32, void) = .empty; // pointer types
+    var ptrs: std.AutoHashMapUnmanaged(u32, void) = .empty; // values of them
+    var out: std.ArrayList(u32) = .empty;
+    var it = m.ops();
+    while (it.next()) |i| switch (i.op) {
+        32 => if (i.args[1] == 5349) try psb_ptrs.put(a, i.args[0], {}), // OpTypePointer PhysicalStorageBuffer
+        124 => if (psb_ptrs.contains(i.args[0])) try ptrs.put(a, i.args[1], {}), // OpBitcast
+        61, 62 => if (i.op == op) {
+            const p = if (op == 61) i.args[2] else i.args[0];
+            const mem = if (op == 61) i.args[3..] else i.args[2..];
+            if (ptrs.contains(p) and mem.len == 2 and mem[0] == 2) try out.append(a, mem[1]); // Aligned
+        },
+        else => {},
+    };
+    return out.items;
+}
+
+test "vk::RawBufferLoad / RawBufferStore: PhysicalStorageBuffer pointers from addresses" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src =
+        \\struct T { float a; float3 b; bool c; };
+        \\struct PC { uint64_t addr; };
+        \\[[vk::push_constant]] PC pc;
+        \\[numthreads(1,1,1)] void main() {
+        \\  float4 v = vk::RawBufferLoad<float4>(pc.addr, 16);
+        \\  T t = vk::RawBufferLoad<T>(pc.addr + 16);
+        \\  uint x = vk::RawBufferLoad(pc.addr + 64);
+        \\  vk::RawBufferStore(pc.addr + 64, x + 1);
+        \\  uint y = vk::RawBufferLoad(pc.addr + 64);
+        \\  t.c = !t.c;
+        \\  vk::RawBufferStore<T>(pc.addr + 80, t, 8);
+        \\  vk::RawBufferStore<float4>(pc.addr + 112, v * (x + y), 16);
+        \\}
+    ;
+    const m = try ok(a, "cs_6_0", &.{}, src);
+    var it = m.ops();
+    var caps: usize = 0;
+    var addressing: ?u32 = null;
+    while (it.next()) |i| switch (i.op) {
+        17 => if (i.args[0] == 5347) {
+            caps += 1; // OpCapability PhysicalStorageBufferAddresses
+        },
+        14 => addressing = i.args[0], // OpMemoryModel
+        else => {},
+    };
+    try expectEqual(@as(usize, 1), caps);
+    try expectEqual(@as(?u32, 5348), addressing); // PhysicalStorageBuffer64
+    // Both loads of pc.addr + 64 stay: the store between them changes it.
+    try std.testing.expectEqualSlices(u32, &.{ 16, 4, 4, 4 }, try physicalAlignments(a, m, 61));
+    try std.testing.expectEqualSlices(u32, &.{ 4, 8, 16 }, try physicalAlignments(a, m, 62));
+    // Storage buffer layout (relaxed std430 by default), the bool a uint.
+    const t = m.named("T").?;
+    try expectEqual(@as(?u32, 4), m.memberDeco(t, 1, offset));
+    try expectEqual(@as(?u32, 16), m.memberDeco(t, 2, offset));
+    // Strict std430 with -fvk-use-gl-layout (as dxc).
+    const gl = try ok(a, "cs_6_0", &.{"-fvk-use-gl-layout"}, src);
+    try expectEqual(@as(?u32, 16), gl.memberDeco(gl.named("T").?, 1, offset));
+    try expectEqual(@as(?u32, 28), gl.memberDeco(gl.named("T").?, 2, offset));
+}
+
+test "vk::RawBufferLoad: the pointee follows the storage buffer layout options" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src =
+        \\struct I { float3 v; };
+        \\struct A { float3 a[2]; float c; };
+        \\struct M { float3x3 m; float c; };
+        \\struct N { I i[2]; float c; };
+        \\struct PC { uint64_t addr; };
+        \\[[vk::push_constant]] PC pc;
+        \\RWStructuredBuffer<float> o;
+        \\[numthreads(1,1,1)] void main() {
+        \\  A x = vk::RawBufferLoad<A>(pc.addr);
+        \\  M y = vk::RawBufferLoad<M>(pc.addr + 64);
+        \\  N z = vk::RawBufferLoad<N>(pc.addr + 128);
+        \\  o[0] = x.c + y.c + z.c;
+        \\}
+    ;
+    const matrix_stride = 7;
+    // Offsets of each struct's `c` and its strides, as dxc: 16-byte
+    // strides by default (valid without scalarBlockLayout), tight ones
+    // with -fvk-use-scalar-layout.
+    const Case = struct { opt: []const []const u8, stride: u32, c_a: u32, c_m: u32, c_n: u32 };
+    for ([_]Case{
+        .{ .opt = &.{}, .stride = 16, .c_a = 32, .c_m = 48, .c_n = 32 },
+        .{ .opt = &.{"-fvk-use-gl-layout"}, .stride = 16, .c_a = 32, .c_m = 48, .c_n = 32 },
+        .{ .opt = &.{"-fvk-use-scalar-layout"}, .stride = 12, .c_a = 24, .c_m = 36, .c_n = 24 },
+    }) |c| {
+        const m = try ok(a, "cs_6_0", c.opt, src);
+        const sa = m.named("A").?;
+        const sm = m.named("M").?;
+        const sn = m.named("N").?;
+        try expectEqual(@as(?u32, c.stride), m.memberStride(sa, 0));
+        try expectEqual(@as(?u32, c.c_a), m.memberDeco(sa, 1, offset));
+        try expectEqual(@as(?u32, c.stride), m.memberDeco(sm, 0, matrix_stride));
+        try expectEqual(@as(?u32, c.c_m), m.memberDeco(sm, 1, offset));
+        try expectEqual(@as(?u32, c.stride), m.memberStride(sn, 0));
+        try expectEqual(@as(?u32, c.c_n), m.memberDeco(sn, 1, offset));
+    }
+}
+
+test "vk::RawBufferLoad / RawBufferStore: alignments are constant powers of two, reported where written" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const pre = "struct PC { uint64_t addr; uint al; }; [[vk::push_constant]] PC pc; static const uint A = 16;\n";
+    const dynamic = try spirv(a, "cs_6_0", &.{}, pre ++ "[numthreads(1,1,1)] void main() { vk::RawBufferStore(pc.addr, vk::RawBufferLoad(pc.addr, pc.al)); }");
+    try std.testing.expect(dynamic.m == null);
+    try std.testing.expect(std.mem.startsWith(u8, dynamic.diagnostics, "hlsl.hlsl:2:90: error: alignment argument must be a constant unsigned integer"));
+    for ([_][]const u8{ "3", "0" }) |al| {
+        const r = try spirv(a, "cs_6_0", &.{}, try std.fmt.allocPrint(a, "{s}[numthreads(1,1,1)] void main() {{ vk::RawBufferStore(pc.addr, 1u, {s}); }}", .{ pre, al }));
+        try std.testing.expect(r.m == null);
+        try std.testing.expect(std.mem.startsWith(u8, r.diagnostics, "hlsl.hlsl:2:67: error: alignment argument must be a power of two"));
+    }
+    const big = try spirv(a, "cs_6_0", &.{}, pre ++ "[numthreads(1,1,1)] void main() { vk::RawBufferStore(pc.addr, 1u, 0x200000000); }");
+    try std.testing.expect(big.m == null);
+    try std.testing.expect(std.mem.startsWith(u8, big.diagnostics, "hlsl.hlsl:2:67: error: alignment argument must fit in 32 bits"));
+    // Floats and bools are not integers, even when they convert to one.
+    // Nor are negative ones unsigned (as dxc).
+    for ([_][]const u8{ "16.5", "16.0", "true", "-4" }) |al| {
+        const r = try spirv(a, "cs_6_0", &.{}, try std.fmt.allocPrint(a, "{s}[numthreads(1,1,1)] void main() {{ vk::RawBufferStore(pc.addr, 1u, {s}); }}", .{ pre, al }));
+        try std.testing.expect(r.m == null);
+        try std.testing.expect(std.mem.startsWith(u8, r.diagnostics, "hlsl.hlsl:2:67: error: alignment argument must be a constant unsigned integer"));
+    }
+    // Constant expressions, not only literals.
+    _ = try ok(a, "cs_6_0", &.{}, pre ++ "[numthreads(1,1,1)] void main() { vk::RawBufferStore(pc.addr, vk::RawBufferLoad(pc.addr, A), A / 2 * sizeof(uint)); }");
+    // At least the largest scalar accessed (VUID-...-06314).
+    const small = try spirv(a, "cs_6_0", &.{}, pre ++ "struct S { float a; double b; };\n[numthreads(1,1,1)] void main() { S s = vk::RawBufferLoad<S>(pc.addr, 4); }");
+    try std.testing.expect(small.m == null);
+    try std.testing.expect(std.mem.startsWith(u8, small.diagnostics, "hlsl.hlsl:3:71: error: alignment argument must be at least 8, the size of the largest scalar accessed"));
+    // Only plain data.
+    const res = try spirv(a, "cs_6_0", &.{}, pre ++ "[numthreads(1,1,1)] void main() { Texture2D t = vk::RawBufferLoad<Texture2D>(pc.addr); }");
+    try std.testing.expect(res.m == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.diagnostics, "error: cannot access a value of type 'Texture2D") != null);
+    // Nor data holding one, reported at the call.
+    const held = try spirv(a, "cs_6_0", &.{}, pre ++ "struct R { float a; Texture2D t[2]; };\n[numthreads(1,1,1)] void main() { R r = vk::RawBufferLoad<R>(pc.addr); }");
+    try std.testing.expect(held.m == null);
+    try std.testing.expect(std.mem.startsWith(u8, held.diagnostics, "hlsl.hlsl:3:41: error: cannot access a value of type 'R' at an address"));
+}
+
+test "vk::RawBufferLoad / RawBufferStore: default alignment covers 64-bit scalars" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // dxc's default of 4 everywhere is invalid for 8-byte scalars.
+    const m = try ok(a, "cs_6_0", &.{},
+        \\struct S { float a; double b; };
+        \\struct PC { uint64_t addr; };
+        \\[[vk::push_constant]] PC pc;
+        \\[numthreads(1,1,1)] void main() {
+        \\  vk::RawBufferStore<uint64_t>(pc.addr, 7);
+        \\  S s = vk::RawBufferLoad<S>(pc.addr + 8);
+        \\  vk::RawBufferStore<double>(pc.addr + 24, s.b);
+        \\  vk::RawBufferStore<uint>(pc.addr + 32, 1u);
+        \\}
+    );
+    try std.testing.expectEqualSlices(u32, &.{8}, try physicalAlignments(a, m, 61));
+    try std.testing.expectEqualSlices(u32, &.{ 8, 8, 4 }, try physicalAlignments(a, m, 62));
+}
+
+test "vk::RawBufferLoad / RawBufferStore: default alignment of 16-bit types is their own" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Claiming 4 (dxc 1.10) for 2-byte data at addr + 2 would be false.
+    const m = try ok(a, "cs_6_2", &.{"-enable-16bit-types"},
+        \\struct H { half a; int16_t b; };
+        \\struct PC { uint64_t addr; };
+        \\[[vk::push_constant]] PC pc;
+        \\[numthreads(1,1,1)] void main() {
+        \\  int16_t x = vk::RawBufferLoad<int16_t>(pc.addr + 2);
+        \\  H h = vk::RawBufferLoad<H>(pc.addr + 6);
+        \\  vk::RawBufferStore<half>(pc.addr + 10, h.a + x);
+        \\  vk::RawBufferStore<uint16_t>(pc.addr + 12, h.b);
+        \\}
+    );
+    try std.testing.expectEqualSlices(u32, &.{ 2, 2 }, try physicalAlignments(a, m, 61));
+    try std.testing.expectEqualSlices(u32, &.{ 2, 2 }, try physicalAlignments(a, m, 62));
+}
+
+test "vk::RawBufferLoad / RawBufferStore: matrices outside structs are wrapped to be laid out" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // A matrix pointee has no MatrixStride or majorness (they decorate
+    // members only): it goes in a struct of its own, oriented as written,
+    // by #pragma pack_matrix, or by -Zpr.
+    const src =
+        \\struct PC { uint64_t addr; };
+        \\[[vk::push_constant]] PC pc;
+        \\RWStructuredBuffer<float4> o;
+        \\typedef float3x3 A[2];
+        \\[numthreads(1,1,1)] void main() {
+        \\  float4x4 m = vk::RawBufferLoad<float4x4>(pc.addr);
+        \\  row_major float2x3 r = vk::RawBufferLoad<row_major float2x3>(pc.addr + 64);
+        \\  A x = vk::RawBufferLoad<A>(pc.addr + 128);
+        \\  vk::RawBufferStore<float4x4>(pc.addr + 256, m);
+        \\  vk::RawBufferStore(pc.addr + 320, x);
+        \\  o[0] = m[1] + r[1].xyzz + x[1][2].xyzz;
+        \\}
+    ;
+    const matrix_stride = 7;
+    const row_major = 4; // (SPIR-V's: HLSL column_major)
+    const col_major = 5;
+    for ([_]struct { opt: []const []const u8, rm: bool }{ .{ .opt = &.{}, .rm = false }, .{ .opt = &.{"-Zpr"}, .rm = true } }) |c| {
+        const m = try ok(a, "cs_6_0", c.opt, src);
+        const w4 = m.named("type.RawBuffer.mat4v4float").?;
+        try expectEqual(@as(?u32, 0), m.memberDeco(w4, 0, offset));
+        try expectEqual(@as(?u32, 16), m.memberDeco(w4, 0, matrix_stride));
+        try std.testing.expect(m.memberDecorated(w4, 0, if (c.rm) col_major else row_major));
+        // Written row_major, whatever -Zpr says; 3-vectors 16 apart.
+        const w23 = m.named("type.RawBuffer.mat2v3float").?;
+        try expectEqual(@as(?u32, 16), m.memberDeco(w23, 0, matrix_stride));
+        try std.testing.expect(m.memberDecorated(w23, 0, col_major));
+        // Arrays of them too (the store infers the type).
+        const wa = m.named("type.RawBuffer.mat3v3float[2]").?;
+        try expectEqual(@as(?u32, 16), m.memberDeco(wa, 0, matrix_stride));
+        try std.testing.expect(m.memberDecorated(wa, 0, if (c.rm) col_major else row_major));
+        try std.testing.expectEqualSlices(u32, &.{ 4, 4, 4 }, try physicalAlignments(a, m, 61));
+        try std.testing.expectEqualSlices(u32, &.{ 4, 4 }, try physicalAlignments(a, m, 62));
+    }
+    const pragma = try ok(a, "cs_6_0", &.{}, "#pragma pack_matrix(row_major)\n" ++ src);
+    try std.testing.expect(pragma.memberDecorated(pragma.named("type.RawBuffer.mat4v4float").?, 0, col_major));
+    // A store inferring the type lays the value out as it is declared, so
+    // what a load reads, a store of it writes back unchanged (one wrapper).
+    for ([_][]const u8{
+        "#pragma pack_matrix(row_major)\n" ++
+            \\struct PC { uint64_t addr; };
+            \\[[vk::push_constant]] PC pc;
+            \\[numthreads(1,1,1)] void main() {
+            \\  float4x4 m = vk::RawBufferLoad<float4x4>(pc.addr);
+            \\  vk::RawBufferStore(pc.addr + 64, m);
+            \\}
+        ,
+        \\struct PC { uint64_t addr; };
+        \\[[vk::push_constant]] PC pc;
+        \\[numthreads(1,1,1)] void main() {
+        \\  row_major float4x4 m = vk::RawBufferLoad<row_major float4x4>(pc.addr);
+        \\  vk::RawBufferStore(pc.addr + 64, m);
+        \\}
+        ,
+        \\struct S { row_major float4x4 m; };
+        \\struct PC { uint64_t addr; };
+        \\[[vk::push_constant]] PC pc;
+        \\StructuredBuffer<S> sb;
+        \\[numthreads(1,1,1)] void main() {
+        \\  S s = vk::RawBufferLoad<S>(pc.addr);
+        \\  vk::RawBufferStore(pc.addr + 64, s.m);
+        \\  vk::RawBufferStore(pc.addr + 128, sb[0].m);
+        \\  vk::RawBufferStore(pc.addr + 192, vk::RawBufferLoad<row_major float4x4>(pc.addr));
+        \\}
+        ,
+        \\struct PC { uint64_t addr; };
+        \\[[vk::push_constant]] PC pc;
+        \\row_major float4x4 f() { return vk::RawBufferLoad<row_major float4x4>(pc.addr); }
+        \\[numthreads(1,1,1)] void main() {
+        \\  row_major float4x4 ms[2];
+        \\  ms[0] = f(); ms[1] = f();
+        \\  vk::RawBufferStore(pc.addr + 64, ms[1]);
+        \\  vk::RawBufferStore(pc.addr + 128, f());
+        \\}
+        ,
+        \\struct PC { uint64_t addr; };
+        \\[[vk::push_constant]] PC pc;
+        \\void put(row_major float4x4 p) { vk::RawBufferStore(pc.addr + 64, p); }
+        \\[numthreads(1,1,1)] void main() { put(vk::RawBufferLoad<row_major float4x4>(pc.addr)); }
+        ,
+        // (A typedef's orientation is lost only in entry signatures: a
+        // helper's parameters and return value keep it.)
+        \\typedef row_major float4x4 RM;
+        \\struct PC { uint64_t addr; };
+        \\[[vk::push_constant]] PC pc;
+        \\RM get() { return vk::RawBufferLoad<RM>(pc.addr); }
+        \\void put(RM p) { vk::RawBufferStore(pc.addr + 64, p); }
+        \\[numthreads(1,1,1)] void main() { put(get()); vk::RawBufferStore(pc.addr + 128, get()); }
+        ,
+        // (The orientation is the type's: a conditional of two row_major
+        // values, or an assignment's value, is row_major too.)
+        \\struct PC { uint64_t addr; bool c; };
+        \\[[vk::push_constant]] PC pc;
+        \\[numthreads(1,1,1)] void main() {
+        \\  row_major float4x4 a = vk::RawBufferLoad<row_major float4x4>(pc.addr);
+        \\  row_major float4x4 b = a, d;
+        \\  vk::RawBufferStore(pc.addr + 64, pc.c ? a : b);
+        \\  vk::RawBufferStore(pc.addr + 128, (d = a));
+        \\}
+        ,
+    }) |s| {
+        const r = try ok(a, "cs_6_0", &.{}, s);
+        try std.testing.expect(r.memberDecorated(r.named("type.RawBuffer.mat4v4float").?, 0, col_major));
+        var n: usize = 0;
+        var i = r.ops();
+        while (i.next()) |o| if (o.op == 5 and std.mem.startsWith(u8, std.mem.sliceAsBytes(o.args[1..]), "type.RawBuffer")) {
+            n += 1; // OpName of a wrapper
+        };
+        try expectEqual(@as(usize, 1), n);
+    }
+    // Vectors, integer matrices (arrays of rows) and structs stay as they are.
+    const plain = try ok(a, "cs_6_0", &.{},
+        \\struct PC { uint64_t addr; };
+        \\[[vk::push_constant]] PC pc;
+        \\RWStructuredBuffer<float4> o;
+        \\[numthreads(1,1,1)] void main() {
+        \\  row_major int2x2 i = vk::RawBufferLoad<row_major int2x2>(pc.addr);
+        \\  o[0] = vk::RawBufferLoad<float4>(pc.addr + 16) + i[1].xyxy + vk::RawBufferLoad<float1x4>(pc.addr + 32);
+        \\}
+    );
+    var it = plain.ops();
+    while (it.next()) |i| if (i.op == 5) try std.testing.expect(!std.mem.startsWith(u8, std.mem.sliceAsBytes(i.args[1..]), "type.RawBuffer")); // OpName
+}
+
+test "structured buffers of matrices are read, written and measured as their elements are laid out" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // row_major float3x2 in std430: 3 rows of float2, 24 bytes (column
+    // major it would be 2 float3 columns, 32): GetDimensions' stride is
+    // the buffer's ArrayStride. Whole row_major integer matrices load and
+    // store as the buffer holds them (arrays of rows).
+    const r = try ok(a, "cs_6_0", &.{},
+        \\RWStructuredBuffer<row_major float3x2> m;
+        \\RWStructuredBuffer<row_major int2x3> i;
+        \\RWStructuredBuffer<uint> o;
+        \\[numthreads(1,1,1)] void main(uint t : SV_GroupIndex) {
+        \\  uint n, stride;
+        \\  m.GetDimensions(n, stride);
+        \\  o[t] = stride;
+        \\  i[t] = i[t + 1] + (int2x3)1;
+        \\}
+    );
+    try expectEqual(@as(?u32, 24), r.memberStride(r.named("type.RWStructuredBuffer.mat3v2float").?, 0));
+    var constants: [2]bool = .{ false, false };
+    var it = r.ops();
+    while (it.next()) |inst| if (inst.op == 43) { // OpConstant
+        if (inst.args[2] == 24) constants[0] = true;
+        if (inst.args[2] == 32) constants[1] = true;
+    };
+    try std.testing.expect(constants[0] and !constants[1]);
+}
+
+test "structured buffers of matrices pass to parameters whatever their orientation" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // (As in clang, the orientation is sugar on the template argument: one
+    // buffer type. Each buffer keeps its own layout: a row_major int2x3 is
+    // 2 rows of int3, 32 bytes, where column-major ones are unsupported.)
+    const r = try ok(a, "cs_6_0", &.{},
+        \\StructuredBuffer<row_major float4x4> b;
+        \\#pragma pack_matrix(row_major)
+        \\StructuredBuffer<float4x4> c;
+        \\RWStructuredBuffer<int2x3> i;
+        \\#pragma pack_matrix(column_major)
+        \\RWStructuredBuffer<float4> o;
+        \\float4 f(StructuredBuffer<float4x4> x) { return x[0][1]; }
+        \\float4 g(RWStructuredBuffer<int2x3> x) {
+        \\  x[1] = x[0];
+        \\  x[2][1] = x.Load(3)[0];
+        \\  uint n, s;
+        \\  x.GetDimensions(n, s);
+        \\  return s;
+        \\}
+        \\[numthreads(1,1,1)] void main() { o[0] = f(b) + f(c) + g(i); }
+    );
+    const st = r.named("type.StructuredBuffer.mat4v4float").?;
+    try std.testing.expect(r.memberDecorated(st, 0, 5)); // ColMajor: HLSL row_major
+    try expectEqual(@as(?u32, 32), r.memberStride(r.named("type.RWStructuredBuffer.mat2v3int").?, 0));
+}
+
+test "buffers keep their binding's layout in functions that are not inlined" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // The callees are specialized for the buffers passed (Vulkan cannot
+    // pass them): their parameters' column-major element types do not
+    // lay the buffers out. A row_major float3x4[2] is two 48-byte
+    // matrices (column-major they would be 64: no such array type may
+    // appear), with its majorness decorated as an array of matrices'; a
+    // row_major int2x2 is an array of rows.
+    for ([_][]const []const u8{ &.{}, &.{"-Od"} }) |extra| {
+        const r = try ok(a, "cs_6_0", extra,
+            \\StructuredBuffer<row_major float3x4[2]> b;
+            \\StructuredBuffer<row_major int2x2> i;
+            \\RWStructuredBuffer<float4> o;
+            \\[noinline] float4 f(StructuredBuffer<float3x4[2]> x, uint k) { return x[k][1][2]; }
+            \\[noinline] float4 g(StructuredBuffer<int2x2> x, uint k) { return float4(x[k][1], x.Load(k)[0]); }
+            \\[numthreads(1,1,1)] void main(uint t : SV_GroupIndex) { o[0] = f(b, t) + g(i, t); }
+        );
+        var strides: [2]usize = .{ 0, 0 };
+        var it = r.ops();
+        while (it.next()) |inst| if (inst.op == 71 and inst.args[1] == 6) { // OpDecorate ArrayStride
+            if (inst.args[2] == 48) strides[0] += 1;
+            if (inst.args[2] == 64) strides[1] += 1;
+        };
+        try std.testing.expect(strides[0] > 0 and strides[1] == 0);
+        const st = r.named("type.StructuredBuffer.matrix<float, 3, 4>[2]").?;
+        try expectEqual(@as(?u32, 16), r.memberDeco(st, 0, 7)); // MatrixStride
+        try std.testing.expect(r.memberDecorated(st, 0, 5)); // ColMajor: HLSL row_major
+    }
+}
+
+test "a struct template holds buffers of either orientation: one instance" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // (StructuredBuffer<row_major float4x4> is a StructuredBuffer<float4x4>,
+    // as in clang: W of either is one type, and the buffer keeps its own
+    // layout through it.)
+    const r = try ok(a, "cs_6_0", &.{},
+        \\StructuredBuffer<row_major float4x4> b;
+        \\RWStructuredBuffer<float4> o;
+        \\template<typename B> struct W { B buf; float4 get() { return buf[0][1]; } };
+        \\[numthreads(1,1,1)] void main() {
+        \\  W<StructuredBuffer<row_major float4x4> > w; w.buf = b;
+        \\  W<StructuredBuffer<float4x4> > v = w;
+        \\  o[0] = v.get();
+        \\}
+    );
+    try std.testing.expect(r.memberDecorated(r.named("type.StructuredBuffer.mat4v4float").?, 0, 5)); // ColMajor: HLSL row_major
+}
+
+test "descriptor heap buffers are laid out as the variable they initialize is declared" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const r = try ok(a, "cs_6_6", &.{},
+        \\RWStructuredBuffer<float4> o;
+        \\[numthreads(1,1,1)] void main() {
+        \\  StructuredBuffer<row_major float4x4> b = ResourceDescriptorHeap[1];
+        \\  o[0] = b[0][1];
+        \\}
+    );
+    try std.testing.expect(r.memberDecorated(r.named("type.StructuredBuffer.mat4v4float").?, 0, 5)); // ColMajor: HLSL row_major
+}
+
+test "vk::RawBufferLoad: a vector address is truncated, with a warning" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const r = try spirv(a, "cs_6_0", &.{}, "RWStructuredBuffer<float4> o;\n[numthreads(1,1,1)] void main() { uint2 p = uint2(1, 2); o[0] = vk::RawBufferLoad<float4>(p); }");
+    try std.testing.expect(r.m != null);
+    try std.testing.expect(std.mem.startsWith(u8, r.diagnostics, "hlsl.hlsl:2:91: warning: implicit truncation of vector type"));
 }

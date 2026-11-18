@@ -13,7 +13,7 @@
 //! - `dx_packed`: DXIL structured buffers, tightly packed at scalar
 //!   alignment.
 //!
-//! Matrices are column-major unless their field is `row_major`: a
+//! Matrices are column-major unless their type is `row_major`: a
 //! column-major RxC matrix is C vectors of R components.
 
 const std = @import("std");
@@ -45,8 +45,8 @@ fn roundUp(v: u32, a: u32) u32 {
 /// A matrix as stored: `count` vectors of `len` components.
 const MatrixVectors = struct { count: u32, len: u32 };
 
-fn matrixVectors(m: anytype, row_major: bool) MatrixVectors {
-    return if (row_major) .{ .count = m.rows, .len = m.cols } else .{ .count = m.cols, .len = m.rows };
+fn matrixVectors(m: anytype) MatrixVectors {
+    return if (m.orientation == .row_major) .{ .count = m.rows, .len = m.cols } else .{ .count = m.cols, .len = m.rows };
 }
 
 /// std430 base alignment of an `n`-vector of `s`-byte components.
@@ -55,9 +55,9 @@ fn vectorAlign(n: u32, s: u32) u32 {
 }
 
 /// Byte distance between the vectors of a stored matrix.
-pub fn matrixStride(t: *const TypeTable, ty: TypeId, row_major: bool, rules: Rules) u32 {
+pub fn matrixStride(t: *const TypeTable, ty: TypeId, rules: Rules) u32 {
     const m = t.get(ty).matrix;
-    const mv = matrixVectors(m, row_major);
+    const mv = matrixVectors(m);
     const s = scalarSize(t, ty);
     return switch (rules) {
         .dx_legacy, .vk_relaxed => 16,
@@ -67,7 +67,7 @@ pub fn matrixStride(t: *const TypeTable, ty: TypeId, row_major: bool, rules: Rul
     };
 }
 
-pub fn alignOf(t: *const TypeTable, ty: TypeId, row_major: bool, rules: Rules) Error!u32 {
+pub fn alignOf(t: *const TypeTable, ty: TypeId, rules: Rules) Error!u32 {
     switch (t.get(ty)) {
         .scalar, .@"enum" => return scalarSize(t, ty),
         // (The base alignment; relaxed placement packs 32-bit vectors
@@ -78,13 +78,13 @@ pub fn alignOf(t: *const TypeTable, ty: TypeId, row_major: bool, rules: Rules) E
         },
         .matrix => return switch (rules) {
             .dx_legacy, .vk_relaxed => 16,
-            .std430, .gl_std140, .gl_std430 => matrixStride(t, ty, row_major, rules),
+            .std430, .gl_std140, .gl_std430 => matrixStride(t, ty, rules),
             .dx_packed, .scalar => scalarSize(t, ty),
         },
         .array => |a| return switch (rules) {
             .dx_legacy => 16,
-            .vk_relaxed, .gl_std140 => @max(16, try alignOf(t, a.elem, row_major, rules)),
-            else => alignOf(t, a.elem, row_major, rules),
+            .vk_relaxed, .gl_std140 => @max(16, try alignOf(t, a.elem, rules)),
+            else => alignOf(t, a.elem, rules),
         },
         .@"struct" => |st| return structAlign(t, st, rules),
         else => return error.Unsupported,
@@ -92,22 +92,22 @@ pub fn alignOf(t: *const TypeTable, ty: TypeId, row_major: bool, rules: Rules) E
 }
 
 /// Size in bytes (dx_legacy does not pad the last element / member).
-pub fn sizeOf(t: *const TypeTable, ty: TypeId, row_major: bool, rules: Rules) Error!u32 {
+pub fn sizeOf(t: *const TypeTable, ty: TypeId, rules: Rules) Error!u32 {
     switch (t.get(ty)) {
         .scalar, .@"enum" => return scalarSize(t, ty),
         .vector => |v| return v.len * scalarSize(t, ty),
         .matrix => |m| {
-            const mv = matrixVectors(m, row_major);
+            const mv = matrixVectors(m);
             const vec = mv.len * scalarSize(t, ty);
             return switch (rules) {
                 .dx_legacy => (mv.count - 1) * 16 + vec,
-                else => mv.count * matrixStride(t, ty, row_major, rules),
+                else => mv.count * matrixStride(t, ty, rules),
             };
         },
         .array => |a| {
-            const stride = try arrayStride(t, a.elem, row_major, rules);
+            const stride = try arrayStride(t, a.elem, rules);
             return switch (rules) {
-                .dx_legacy => (a.len - 1) * stride + try sizeOf(t, a.elem, row_major, rules),
+                .dx_legacy => (a.len - 1) * stride + try sizeOf(t, a.elem, rules),
                 else => a.len * stride,
             };
         },
@@ -117,26 +117,26 @@ pub fn sizeOf(t: *const TypeTable, ty: TypeId, row_major: bool, rules: Rules) Er
 }
 
 /// Byte distance between array elements.
-pub fn arrayStride(t: *const TypeTable, elem: TypeId, row_major: bool, rules: Rules) Error!u32 {
-    const size = try sizeOf(t, elem, row_major, rules);
+pub fn arrayStride(t: *const TypeTable, elem: TypeId, rules: Rules) Error!u32 {
+    const size = try sizeOf(t, elem, rules);
     return switch (rules) {
         .dx_legacy, .vk_relaxed => roundUp(size, 16),
-        .gl_std140 => roundUp(size, @max(16, try alignOf(t, elem, row_major, rules))),
-        .std430, .gl_std430 => roundUp(size, try alignOf(t, elem, row_major, rules)),
+        .gl_std140 => roundUp(size, @max(16, try alignOf(t, elem, rules))),
+        .std430, .gl_std430 => roundUp(size, try alignOf(t, elem, rules)),
         .dx_packed => size,
-        .scalar => roundUp(size, try alignOf(t, elem, row_major, rules)),
+        .scalar => roundUp(size, try alignOf(t, elem, rules)),
     };
 }
 
 /// Offset where a member of type `ty` goes when the previous one ended at
 /// `off`.
-pub fn place(t: *const TypeTable, off: u32, ty: TypeId, row_major: bool, rules: Rules) Error!u32 {
+pub fn place(t: *const TypeTable, off: u32, ty: TypeId, rules: Rules) Error!u32 {
     switch (t.get(ty)) {
         .scalar, .@"enum", .vector => {
-            const size = try sizeOf(t, ty, row_major, rules);
+            const size = try sizeOf(t, ty, rules);
             switch (rules) {
                 // Strict GLSL: vectors at their full alignment.
-                .gl_std140, .gl_std430 => return roundUp(off, try alignOf(t, ty, row_major, rules)),
+                .gl_std140, .gl_std430 => return roundUp(off, try alignOf(t, ty, rules)),
                 .scalar => return roundUp(off, scalarSize(t, ty)),
                 else => {},
             }
@@ -150,7 +150,7 @@ pub fn place(t: *const TypeTable, off: u32, ty: TypeId, row_major: bool, rules: 
             if (rules != .dx_packed and o / 16 != (o + size - 1) / 16) o = roundUp(o, 16);
             return o;
         },
-        .matrix, .array, .@"struct" => return roundUp(off, try alignOf(t, ty, row_major, rules)),
+        .matrix, .array, .@"struct" => return roundUp(off, try alignOf(t, ty, rules)),
         else => return error.Unsupported,
     }
 }
@@ -161,7 +161,7 @@ fn structAlign(t: *const TypeTable, info: *const types.StructInfo, rules: Rules)
         else => {
             var al: u32 = if (rules == .vk_relaxed or rules == .gl_std140) 16 else 1;
             for (info.fields.items) |f| if (!isOpaque(t, f.type)) {
-                al = @max(al, try alignOf(t, f.type, f.row_major, rules));
+                al = @max(al, try alignOf(t, f.type, rules));
             };
             return al;
         },
@@ -195,7 +195,7 @@ fn layoutFields(t: *const TypeTable, info: *const types.StructInfo, rules: Rules
     // follow the last explicitly placed one.
     var packed_end: ?u32 = null;
     for (info.fields.items[first..]) |f| if (f.pack_offset) |po| {
-        packed_end = @max(packed_end orelse 0, po + try sizeOf(t, f.type, f.row_major, rules));
+        packed_end = @max(packed_end orelse 0, po + try sizeOf(t, f.type, rules));
     };
     if (packed_end) |pe| off = @max(off, pe);
     var end: u32 = off;
@@ -207,8 +207,8 @@ fn layoutFields(t: *const TypeTable, info: *const types.StructInfo, rules: Rules
             po
         else at: {
             // [[vk::offset]] (SPIR-V only): later members continue from it.
-            const o = if (f.vk_offset) |vo| vo else try place(t, off, f.type, f.row_major, rules);
-            off = o + try sizeOf(t, f.type, f.row_major, rules);
+            const o = if (f.vk_offset) |vo| vo else try place(t, off, f.type, rules);
+            off = o + try sizeOf(t, f.type, rules);
             end = @max(end, off);
             break :at o;
         };
@@ -226,27 +226,27 @@ pub fn fieldOffsets(a: Allocator, t: *const TypeTable, info: *const types.Struct
 
 /// Byte offset of flattened component `k` of a value of type `ty` (row-major
 /// component order for matrices, as the IR flattens them).
-pub fn componentOffset(a: Allocator, t: *const TypeTable, ty: TypeId, row_major: bool, k: u32, rules: Rules) Error!u32 {
+pub fn componentOffset(a: Allocator, t: *const TypeTable, ty: TypeId, k: u32, rules: Rules) Error!u32 {
     switch (t.get(ty)) {
         .scalar, .@"enum" => return 0,
         .vector => return k * scalarSize(t, ty),
         .matrix => |m| {
             const r = k / m.cols;
             const c = k % m.cols;
-            const stride = matrixStride(t, ty, row_major, rules);
+            const stride = matrixStride(t, ty, rules);
             const s = scalarSize(t, ty);
-            return if (row_major) r * stride + c * s else c * stride + r * s;
+            return if (m.orientation == .row_major) r * stride + c * s else c * stride + r * s;
         },
         .array => |arr| {
             const n = try flatCount(t, arr.elem);
-            return (k / n) * try arrayStride(t, arr.elem, row_major, rules) + try componentOffset(a, t, arr.elem, row_major, k % n, rules);
+            return (k / n) * try arrayStride(t, arr.elem, rules) + try componentOffset(a, t, arr.elem, k % n, rules);
         },
         .@"struct" => |s| {
             const offs = try fieldOffsets(a, t, s, rules);
             var kk = k;
             for (s.fields.items, offs) |f, o| {
                 const n = try flatCount(t, f.type);
-                if (kk < n) return o + try componentOffset(a, t, f.type, f.row_major, kk, rules);
+                if (kk < n) return o + try componentOffset(a, t, f.type, kk, rules);
                 kk -= n;
             }
             return error.Unsupported;
@@ -289,20 +289,20 @@ test "layouts match dxc" {
     const f = try t.scalar(.float);
     const f2 = try t.vector(.float, 2);
     const f3 = try t.vector(.float, 3);
-    try std.testing.expectEqual(@as(u32, 4), try place(&t, 4, f2, false, .dx_legacy));
-    try std.testing.expectEqual(@as(u32, 16), try place(&t, 12, f3, false, .dx_legacy));
-    try std.testing.expectEqual(@as(u32, 20), try sizeOf(&t, try t.array(f, 2), false, .dx_legacy));
-    try std.testing.expectEqual(@as(u32, 32), try sizeOf(&t, try t.array(f, 2), false, .vk_relaxed));
+    try std.testing.expectEqual(@as(u32, 4), try place(&t, 4, f2, .dx_legacy));
+    try std.testing.expectEqual(@as(u32, 16), try place(&t, 12, f3, .dx_legacy));
+    try std.testing.expectEqual(@as(u32, 20), try sizeOf(&t, try t.array(f, 2), .dx_legacy));
+    try std.testing.expectEqual(@as(u32, 32), try sizeOf(&t, try t.array(f, 2), .vk_relaxed));
     // struct S { float a; float3 b; float2 c; float d; float3 e; }
     const s = try a.create(types.StructInfo);
     s.* = .{ .name = "S", .complete = true };
     for ([_]TypeId{ f, f3, f2, f, f3 }, 0..) |ft, i| try s.fields.append(a, .{ .name = &[_]u8{@intCast('a' + i)}, .type = ft });
     const st = try t.intern(.{ .@"struct" = s });
     try std.testing.expectEqualSlices(u32, &.{ 0, 4, 16, 24, 32 }, try fieldOffsets(a, &t, s, .std430));
-    try std.testing.expectEqual(@as(u32, 48), try sizeOf(&t, st, false, .std430));
+    try std.testing.expectEqual(@as(u32, 48), try sizeOf(&t, st, .std430));
     try std.testing.expectEqualSlices(u32, &.{ 0, 4, 16, 24, 28 }, try fieldOffsets(a, &t, s, .dx_packed));
     // float2x3: column-major in std430 is 3 vec2 columns (stride 8).
     const m23 = try t.matrix(.float, 2, 3);
-    try std.testing.expectEqual(@as(u32, 24), try sizeOf(&t, m23, false, .std430));
-    try std.testing.expectEqual(@as(u32, 32), try sizeOf(&t, m23, true, .std430));
+    try std.testing.expectEqual(@as(u32, 24), try sizeOf(&t, m23, .std430));
+    try std.testing.expectEqual(@as(u32, 32), try sizeOf(&t, try t.oriented(m23, .row_major, .replace), .std430));
 }

@@ -40,10 +40,9 @@ pub const Options = struct {
     row_major: bool = false,
 };
 
-/// Matrix orientation and float normalization written on a type: sugar
-/// that does not change type identity. `pack` is the `#pragma
-/// pack_matrix` in effect where the type was written (true: row_major).
-pub const TypeAttrs = struct { orientation: ?[]const u8 = null, norm: ?[]const u8 = null, pack: ?bool = null };
+/// Float normalization written on a type: sugar that does not change type
+/// identity. (A matrix's orientation is part of its type: Type.matrix.)
+pub const TypeAttrs = struct { norm: ?[]const u8 = null };
 
 pub const Storage = enum { global_uniform, global_static, groupshared, cbuffer, local, local_static, param, constant };
 
@@ -66,12 +65,14 @@ pub const Variable = struct {
     param_index: u32 = 0,
     /// The `cbuffer` / `tbuffer` declaration holding the variable.
     block: ?*const ast.Decl = null,
-    /// Matrices in the variable are row_major (layout only).
-    row_major: bool = false,
 };
 
 /// A global variable or a cbuffer / tbuffer block.
 pub const GlobalDecl = union(enum) { variable: *Variable, cbuffer: *const ast.Decl };
+
+/// A checked vk::RawBufferLoad / RawBufferStore: the type of the memory
+/// accessed (its matrices oriented) and the Aligned operand of the access.
+pub const RawBuffer = struct { ty: TypeId, alignment: u32 };
 
 /// What an expression refers to, recorded by Sema for lowering
 /// (`Expr.info` is an index into `Sema.resolutions` plus one).
@@ -82,7 +83,8 @@ pub const Resolution = union(enum) {
     function: *Function,
     /// A call to an intrinsic or builtin method (`object` is the method's
     /// object type).
-    intrinsic: struct { index: u16, params: []const TypeId, object: ?TypeId = null },
+    /// `raw_buffer`: a checked vk::RawBufferLoad / RawBufferStore.
+    intrinsic: struct { index: u16, params: []const TypeId, object: ?TypeId = null, raw_buffer: ?RawBuffer = null },
     /// A struct field (member expression).
     field: u32,
     /// A field named without `this.` inside a method.
@@ -97,7 +99,11 @@ pub const Resolution = union(enum) {
 
 pub const Param = struct {
     name: []const u8,
+    /// Oriented as declared (Sema.declaratorType).
     type: TypeId,
+    /// `type` as an entry point's signature orients it
+    /// (Sema.signatureType).
+    sig_type: TypeId,
     dir: enum { in, out, inout },
     has_default: bool,
     /// A template instance's default argument that does not convert to
@@ -113,6 +119,8 @@ pub const Function = struct {
     decl: *const ast.FuncDecl,
     loc: Loc,
     ret: TypeId,
+    /// `ret` as an entry point's signature orients it.
+    sig_ret: TypeId,
     params: []Param,
     defined: bool,
     /// Struct the method belongs to.
@@ -209,10 +217,7 @@ pub const Sema = struct {
     /// Every function and method, in declaration order.
     all_functions: std.ArrayList(*Function) = .empty,
     /// Type attributes carried by typedef names (clang's attributed-type
-    /// sugar: `typedef row_major float4x4 rm;`). Keyed by name.
-    /// Function parameters' and return types' matrix orientation (for
-    /// entry point signatures), keyed by the type as written.
-    sig_row_major: std.AutoHashMapUnmanaged(*const ast.TypeRef, bool) = .empty,
+    /// sugar: `typedef unorm float4 un;`). Keyed by name.
     typedef_attrs: std.StringHashMapUnmanaged(TypeAttrs) = .empty,
     /// Type attributes of the last resolveType result.
     last_attrs: TypeAttrs = .{},
@@ -446,7 +451,7 @@ pub const Sema = struct {
             }
         }
         for (pats, args) |pat, arg| switch (arg) {
-            .type => |t| if ((try s.typeArg(pat)) != t) return null,
+            .type => |t| if (!s.types.same(try s.typeArg(pat) orelse return null, t)) return null,
             .value => |v| if ((s.constArg(pat) orelse return null) != v) return null,
         };
         return sc;
@@ -505,10 +510,14 @@ pub const Sema = struct {
                 try key.print(s.arena, "v{d},", .{value});
             } else {
                 const t: ?TypeId = if (arg) |x| try s.typeArg(x) else if (i < deduced.len and deduced[i] != null) deduced[i].?.type else if (p.default) |dflt| try s.typeArg(dflt) else null;
-                const ty = t orelse {
+                // (Instances are of canonical types, as in clang: the
+                // parameter's declarations orient their matrices, and
+                // their buffers' elements; a buffer passed in keeps its
+                // own layout, its binding's.)
+                const ty = s.types.canonical(t orelse {
                     if (!quiet) s.err(loc, "could not deduce template argument '{s}'", .{p.name});
                     return null;
-                };
+                });
                 bound[i] = .{ .type = ty };
                 const gop = try sc.syms.getOrPut(s.arena, p.name);
                 gop.value_ptr.* = .{ .type = ty };
@@ -843,7 +852,7 @@ pub const Sema = struct {
         var kept: usize = 0;
         for (all.funcs.items) |a| {
             const superseded = !a.defined and for (all.funcs.items) |b2| {
-                if (b2 != a and b2.defined and sameSignature(a, b2)) break true;
+                if (b2 != a and b2.defined and s.sameSignature(a, b2)) break true;
             } else false;
             if (superseded) continue;
             all.funcs.items[kept] = a;
@@ -852,7 +861,7 @@ pub const Sema = struct {
         all.funcs.shrinkRetainingCapacity(kept);
         // Instances with the same parameters would need C++ partial
         // ordering, which zdxc does not model.
-        for (all.funcs.items, 0..) |a, k| for (all.funcs.items[k + 1 ..]) |b2| if (sameSignature(a, b2)) {
+        for (all.funcs.items, 0..) |a, k| for (all.funcs.items[k + 1 ..]) |b2| if (s.sameSignature(a, b2)) {
             s.err(callee.loc, "choosing among these function templates is not supported yet", .{});
             return TypeTable.error_type;
         };
@@ -1159,9 +1168,8 @@ pub const Sema = struct {
                 return TypeTable.error_type;
             }
         };
-        for (t.attr_words) |w| s.applyTypeAttr(w, base, &attrs);
-        if (s.types.get(base) == .matrix) attrs.pack = t.pack_matrix;
         var ty = base;
+        for (t.attr_words) |w| ty = try s.applyTypeAttr(w, ty, &attrs);
         // Array dimensions on template arguments (`float[3]`).
         var i = t.array_dims.len;
         while (i > 0) {
@@ -1172,35 +1180,69 @@ pub const Sema = struct {
         return ty;
     }
 
-    /// Written orientation, else `#pragma pack_matrix`'s, else `-Zpr`'s.
-    pub fn isRowMajor(s: *const Sema, a: TypeAttrs) bool {
-        if (a.orientation) |o| return eql(o, "row_major");
-        return a.pack orelse s.opts.row_major;
+    /// -Zpr's orientation.
+    fn defaultOrientation(s: *const Sema) types.Orientation {
+        return if (s.opts.row_major) .row_major else .column_major;
     }
 
-    /// A parameter's or return value's orientation in a signature: as
-    /// written on it or by `#pragma pack_matrix`. A typedef's orientation
-    /// is lost there in dxc (and blocks the pragma), leaving `-Zpr`'s.
-    fn sigRowMajor(s: *const Sema, words: []const ast.QualWord, type_attrs: TypeAttrs) bool {
+    /// `ty` (resolved from `t`) as a declaration's type: matrices without
+    /// an orientation take the `#pragma pack_matrix` in effect where `t`
+    /// was written (when `t` names a matrix, not a typedef of an array of
+    /// them), else `-Zpr`'s.
+    fn declaredType(s: *Sema, ty: TypeId, t: ?*const ast.TypeRef) Allocator.Error!TypeId {
+        return s.declaratorType(ty, ty, t);
+    }
+
+    /// `declaredType` of `ty`: `named`, which `t` resolves to, plus a
+    /// declarator's dimensions.
+    fn declaratorType(s: *Sema, ty: TypeId, named: TypeId, t: ?*const ast.TypeRef) Allocator.Error!TypeId {
+        return s.types.oriented(try s.withPragma(ty, named, t), s.defaultOrientation(), .default);
+    }
+
+    /// `ty` with the `#pragma pack_matrix` in effect where `t` was written
+    /// when `t` names a matrix without an orientation (`named`, which `t`
+    /// resolves to; `ty` may add a declarator's dimensions).
+    fn withPragma(s: *Sema, ty: TypeId, named: TypeId, t: ?*const ast.TypeRef) Allocator.Error!TypeId {
+        const ref = t orelse return ty;
+        const rm = ref.pack_matrix orelse return ty;
+        // (Under the template argument's own dimensions: `float4x4[2]`.)
+        var inner = named;
+        for (ref.array_dims) |_| inner = switch (s.types.get(inner)) {
+            .array => |a| a.elem,
+            else => return ty,
+        };
+        if (s.types.get(inner) != .matrix) return ty;
+        return s.types.oriented(ty, if (rm) .row_major else .column_major, .default);
+    }
+
+    /// The type of an entry point's parameter or return value in its
+    /// signature (`ty`: `base`, which `t` resolves to, plus the
+    /// declarator's dimensions): oriented as written among its qualifiers
+    /// or by `#pragma pack_matrix`. A typedef's orientation is lost there
+    /// in dxc (and blocks the pragma), leaving `-Zpr`'s. Elsewhere the
+    /// parameter is as declared (declaratorType).
+    fn signatureType(s: *Sema, ty: TypeId, base: TypeId, words: []const ast.QualWord, t: *const ast.TypeRef) Allocator.Error!TypeId {
         for (words) |w| {
-            if (eql(w.word, "row_major")) return true;
-            if (eql(w.word, "column_major")) return false;
+            if (eql(w.word, "row_major")) return s.types.oriented(ty, .row_major, .replace);
+            if (eql(w.word, "column_major")) return s.types.oriented(ty, .column_major, .replace);
         }
-        if (type_attrs.orientation != null) return s.opts.row_major;
-        return type_attrs.pack orelse s.opts.row_major;
+        if (s.types.orientation(base) != .none) return s.types.oriented(ty, s.defaultOrientation(), .replace);
+        return s.types.oriented(try s.withPragma(ty, base, t), s.defaultOrientation(), .default);
     }
 
-    /// Applies a type attribute (dxc's handleHLSLTypeAttr checks).
-    fn applyTypeAttr(s: *Sema, w: ast.QualWord, ty: TypeId, a: *TypeAttrs) void {
-        if (ty == TypeTable.error_type) return;
+    /// Applies a type attribute (dxc's handleHLSLTypeAttr checks): returns
+    /// `ty` oriented by `row_major` / `column_major`.
+    fn applyTypeAttr(s: *Sema, w: ast.QualWord, ty: TypeId, a: *TypeAttrs) Allocator.Error!TypeId {
+        if (ty == TypeTable.error_type) return ty;
         if (eql(w.word, "row_major") or eql(w.word, "column_major")) {
+            const want: types.Orientation = if (eql(w.word, "row_major")) .row_major else .column_major;
             if (s.types.get(ty) != .matrix) {
                 s.err(w.loc, "'{s}' can only be used with a matrix type", .{w.word});
-            } else if (a.orientation) |o| {
-                if (eql(o, w.word)) {
+            } else if (s.types.get(ty).matrix.orientation != .none) {
+                if (s.types.get(ty).matrix.orientation == want) {
                     s.warn(w.loc, "ignored-attributes", "attribute '{s}' is already applied", .{w.word});
                 } else s.err(w.loc, "'row_major' and 'column_major' attributes are not compatible", .{});
-            } else a.orientation = w.word;
+            } else return s.types.oriented(ty, want, .replace);
         } else if (eql(w.word, "unorm") or eql(w.word, "snorm")) {
             const c = s.types.component(ty);
             if (c == null or !c.?.isFloat()) {
@@ -1211,6 +1253,7 @@ pub const Sema = struct {
                 } else s.err(w.loc, "'unorm' and 'snorm' attributes are not compatible", .{});
             } else a.norm = w.word;
         }
+        return ty;
     }
 
     /// `attrs` receives the attributes the named type carries (a typedef's,
@@ -1282,11 +1325,16 @@ pub const Sema = struct {
                     return TypeTable.error_type;
                 }
                 var elem: TypeId = TypeTable.void_type;
-                var row_major = false;
                 if (args.len > 0) {
                     elem = try s.typeArg(args[0]) orelse TypeTable.error_type;
                     const structured = kind == .structured_buffer or kind == .rw_structured_buffer or kind == .append_structured_buffer or kind == .consume_structured_buffer;
-                    if (structured and s.types.get(elem) == .matrix) row_major = s.isRowMajor(if (args[0] == .type) s.last_attrs else .{});
+                    // A structured buffer's matrix elements are stored as
+                    // the template argument says, or by the `#pragma
+                    // pack_matrix` there (else by -Zpr: the buffer's
+                    // declaration orients them, declaredType). (dxc's DXIL
+                    // stores them by -Zpr alone: the DXIL emitter's
+                    // resourceFor.)
+                    if (structured) elem = try s.withPragma(elem, elem, if (args[0] == .type) args[0].type else null);
                 } else if (isTextureOrTypedBuffer(kind)) {
                     elem = try s.types.vector(.float, 4); // Texture2D == Texture2D<float4>
                 }
@@ -1304,7 +1352,7 @@ pub const Sema = struct {
                     }
                 }
                 if ((kind == .constant_buffer or kind == .texture_buffer) and args.len > 0) s.checkLongVectors(elem, templateArgLoc(args[0]), "ConstantBuffers or TextureBuffers");
-                return s.types.intern(.{ .resource = .{ .kind = kind, .elem = elem, .name = n, .row_major = row_major } });
+                return s.types.intern(.{ .resource = .{ .kind = kind, .elem = elem, .name = n } });
             }
             const streams = [_]struct { []const u8, @FieldType(@FieldType(types.Type, "stream"), "kind") }{ .{ "PointStream", .point }, .{ "LineStream", .line }, .{ "TriangleStream", .triangle } };
             for (streams) |st| if (std.mem.eql(u8, n, st[0])) {
@@ -1818,13 +1866,14 @@ pub const Sema = struct {
                 }
                 var base = try s.resolveType(td.type);
                 if (s.types.get(base) == .spirv and td.attrs.len > 0) base = try s.spirvTypeWithAttrs(base, td.attrs);
-                var attrs = s.checkModifiers(.typedef, td.qual_words, d.loc, base, s.last_attrs);
-                if (attrs.orientation == null) if (attrs.pack) |rm| {
-                    attrs.orientation = if (rm) "row_major" else "column_major";
-                };
+                const attrs = s.last_attrs;
+                // (The pragma where the typedef is written orients it; -Zpr
+                // applies where it is used.)
+                base = try s.checkModifiers(.typedef, td.qual_words, d.loc, base);
+                base = try s.withPragma(base, base, td.type);
                 const ty = try s.applyArrayDims(base, td.array_dims);
                 try s.declare(td.name, .{ .type = ty }, d.loc);
-                if (attrs.orientation != null or attrs.norm != null) try s.typedef_attrs.put(s.arena, td.name, attrs);
+                if (attrs.norm != null) try s.typedef_attrs.put(s.arena, td.name, attrs);
             },
             .@"enum" => |e| try s.enumDecl(d, e),
             .namespace => |n| {
@@ -1999,8 +2048,8 @@ pub const Sema = struct {
                     s.err(start, "array dimensions of struct/class members must be explicit", .{});
                     continue;
                 }
-                const fattrs = s.checkModifiers(.field, v.qual_words, start, fbase, s.last_attrs);
-                var ft = try s.applyArrayDims(fbase, v.array_dims);
+                const fdecl = try s.declaredType(try s.checkModifiers(.field, v.qual_words, start, fbase), v.type);
+                var ft = try s.applyArrayDims(fdecl, v.array_dims);
                 // `[[vk::ext_capability(...)]] SpirvType field;`
                 if (s.types.get(ft) == .spirv and v.attrs.len > 0) ft = try s.spirvTypeWithAttrs(ft, v.attrs);
                 s.checkSemantics(.field, v.semantics, ft, false);
@@ -2013,7 +2062,7 @@ pub const Sema = struct {
                 if (s.opts.spirv) if (s.vkAttrInt(v.attrs, "vk::offset")) |vo| if (vo % 16 != 0 and s.types.get(ft) == .@"struct") {
                     s.warn(v.name_loc, null, "The offset provided in the attribute should be 16-byte aligned.", .{});
                 };
-                try info.fields.append(s.arena, .{ .name = v.name, .type = ft, .row_major = s.isRowMajor(fattrs), .semantic = fsem, .interp = interpOf(v.quals), .precise = v.quals.precise, .vk_location = s.vkAttrInt(v.attrs, "vk::location"), .vk_index = s.vkAttrInt(v.attrs, "vk::index"), .vk_offset = if (s.opts.spirv) s.vkAttrInt(v.attrs, "vk::offset") else null, .vk_builtin = vkAttrString(v.attrs, "vk::builtin"), .decorations = if (s.opts.spirv) try s.memberDecorations(v.attrs) else &.{} });
+                try info.fields.append(s.arena, .{ .name = v.name, .type = ft, .semantic = fsem, .interp = interpOf(v.quals), .precise = v.quals.precise, .vk_location = s.vkAttrInt(v.attrs, "vk::location"), .vk_index = s.vkAttrInt(v.attrs, "vk::index"), .vk_offset = if (s.opts.spirv) s.vkAttrInt(v.attrs, "vk::offset") else null, .vk_builtin = vkAttrString(v.attrs, "vk::builtin"), .decorations = if (s.opts.spirv) try s.memberDecorations(v.attrs) else &.{} });
             },
             .func => {},
             else => try s.decl(m, .member),
@@ -2052,11 +2101,11 @@ pub const Sema = struct {
     /// matrix-orientation type-attribute checks. `start` is where the
     /// declaration begins; `ty` is the declared (or return) type before
     /// declarator array dimensions.
-    /// Returns the declaration's type attributes (`type_attrs` plus any
-    /// orientation written among the qualifiers).
-    fn checkModifiers(s: *Sema, kind: DeclKind, words: []const ast.QualWord, start: Loc, ty: TypeId, type_attrs: TypeAttrs) TypeAttrs {
-        var attrs = type_attrs;
-        if (words.len == 0) return attrs;
+    /// Returns `ty` oriented as written among the qualifiers.
+    fn checkModifiers(s: *Sema, kind: DeclKind, words: []const ast.QualWord, start: Loc, ty: TypeId) Allocator.Error!TypeId {
+        var oriented = ty;
+        var attrs: TypeAttrs = .{};
+        if (words.len == 0) return oriented;
         const what = kind.text();
         // Storage classes: the first one wins (typedef counts as one).
         var storage: ?[]const u8 = if (kind == .typedef) "typedef" else null;
@@ -2074,7 +2123,7 @@ pub const Sema = struct {
             } else if (eql(w.word, "volatile")) {
                 is_volatile = true;
             } else if (eql(w.word, "row_major") or eql(w.word, "column_major")) {
-                s.applyTypeAttr(w, ty, &attrs);
+                oriented = try s.applyTypeAttr(w, oriented, &attrs);
             }
         }
         const is_static = storage != null and eql(storage.?, "static");
@@ -2181,7 +2230,7 @@ pub const Sema = struct {
             } else if (!usage_out) s.err(start, "'{s}' object must be an out parameter", .{m.word});
         }
         if (param and !(usage_in and usage_out) and s.types.get(ty) == .stream) s.err(start, "stream-output object must be an inout parameter", .{});
-        return attrs;
+        return oriented;
     }
 
     /// Conflicting repeated function attributes. clang applies them in
@@ -2368,22 +2417,23 @@ pub const Sema = struct {
         if (std.mem.indexOf(u8, v.name, "::") != null) return; // out-of-line static member definition
         const is_auto = v.type.name.isSimple("auto");
         const base = if (is_auto) TypeTable.error_type else try s.resolveType(v.type);
-        const decl_attrs = s.checkModifiers(switch (ctx) {
+        const declared = try s.declaredType(try s.checkModifiers(switch (ctx) {
             .local => .local_variable,
             .member => .field,
             .global, .cbuffer => .global_variable,
-        }, v.qual_words, if (v.qual_words.len > 0) v.qual_words[0].loc else v.type.loc, base, if (is_auto) .{} else s.last_attrs);
+        }, v.qual_words, if (v.qual_words.len > 0) v.qual_words[0].loc else v.type.loc, base), if (is_auto) null else v.type);
         try s.checkArrayDims(v.name_loc, base, v.array_dims);
-        var ty = try s.applyArrayDims(base, v.array_dims);
+        var ty = try s.applyArrayDims(declared, v.array_dims);
         if (is_auto) {
             // `auto x = init`: the initializer's type (literals become
-            // concrete).
+            // concrete; matrices keep their orientation, else take -Zpr's).
             if (v.init) |init_e| {
                 const t = try s.expr(init_e);
                 ty = t.ty;
                 if (s.types.component(ty)) |c| if (c.isLiteral()) {
                     ty = try s.types.withComponent(ty, c.concrete());
                 };
+                ty = try s.declaredType(ty, null);
             }
         }
         if (ty == TypeTable.void_type) {
@@ -2419,7 +2469,6 @@ pub const Sema = struct {
             .init = v.init,
             .init_scope = s.scope,
             .decl = v,
-            .row_major = s.isRowMajor(decl_attrs),
         };
         try s.declare(v.name, .{ .variable = variable }, v.name_loc);
         try s.decl_vars.put(s.arena, v, variable);
@@ -2507,25 +2556,28 @@ pub const Sema = struct {
             }
         }
         // `auto` return types are deduced in HLSL 202x; unconstrained here.
-        const ret = if (f.ret.name.isSimple("auto")) TypeTable.error_type else try s.applyArrayDims(try s.resolveType(f.ret), f.ret_dims);
+        // (Oriented as declared; an entry point's signature orients it its
+        // own way.)
+        const auto = f.ret.name.isSimple("auto");
+        const rbase = if (auto) TypeTable.error_type else try s.resolveType(f.ret);
+        const rdecl = if (auto) rbase else try s.applyArrayDims(rbase, f.ret_dims);
+        const rwritten = try s.checkModifiers(if (owner != null) .method else .function, f.qual_words, if (f.qual_words.len > 0) f.qual_words[0].loc else f.ret.loc, rdecl);
+        const ret = if (auto) rbase else try s.declaratorType(rwritten, rbase, f.ret);
+        const sig_ret = if (auto) rbase else try s.signatureType(rdecl, rbase, f.qual_words, f.ret);
         const params = try s.arena.alloc(Param, f.params.len);
-        const ret_type_attrs = s.last_attrs;
-        _ = s.checkModifiers(if (owner != null) .method else .function, f.qual_words, if (f.qual_words.len > 0) f.qual_words[0].loc else f.ret.loc, ret, ret_type_attrs);
-        try s.sig_row_major.put(s.arena, f.ret, s.sigRowMajor(f.qual_words, ret_type_attrs));
         s.checkFunctionAttrs(f.attrs);
         for (f.params, params) |p, *out| {
             const pbase = try s.resolveType(p.type);
-            const ptype_attrs = s.last_attrs;
-            _ = s.checkModifiers(.parameter, p.qual_words, if (p.qual_words.len > 0) p.qual_words[0].loc else p.type.loc, pbase, ptype_attrs);
-            try s.sig_row_major.put(s.arena, p.type, s.sigRowMajor(p.qual_words, ptype_attrs));
+            const pwritten = try s.checkModifiers(.parameter, p.qual_words, if (p.qual_words.len > 0) p.qual_words[0].loc else p.type.loc, pbase);
             try s.checkArrayDims(p.name_loc, pbase, p.array_dims);
-            const pt = try s.applyArrayDims(pbase, p.array_dims);
+            const pt = try s.declaratorType(try s.applyArrayDims(pwritten, p.array_dims), pbase, p.type);
             s.checkSemantics(.parameter, p.semantics, pt, false);
             if (s.types.get(pbase) == .string) s.err(p.name_loc, "parameter of type string is not supported", .{});
             s.checkBoolBitfield(pt, p.name_loc);
             out.* = .{
                 .name = p.name,
                 .type = pt,
+                .sig_type = try s.signatureType(try s.applyArrayDims(pbase, p.array_dims), pbase, p.qual_words, p.type),
                 .dir = if (p.quals.in and p.quals.out) .inout else if (p.quals.out) .out else .in,
                 .has_default = p.init != null,
                 .groupshared = p.quals.groupshared,
@@ -2542,7 +2594,7 @@ pub const Sema = struct {
             }
         }
         const func = try s.arena.create(Function);
-        func.* = .{ .name = name, .decl = f, .loc = d.loc, .ret = ret, .params = params, .defined = f.body != null, .owner = owner };
+        func.* = .{ .name = name, .decl = f, .loc = d.loc, .ret = ret, .sig_ret = sig_ret, .params = params, .defined = f.body != null, .owner = owner };
 
         // Add to the overload set, matching an earlier prototype if any.
         const set = blk: {
@@ -2562,7 +2614,7 @@ pub const Sema = struct {
         };
         var existing: ?*Function = null;
         for (set.funcs.items) |other| {
-            if (sameSignature(other, func)) existing = other;
+            if (s.sameSignature(other, func)) existing = other;
         }
         if (existing) |e| {
             if (e.defined and func.defined) {
@@ -2722,12 +2774,12 @@ pub const Sema = struct {
         for (body.kind.compound) |st| try s.stmt(st);
     }
 
-    fn sameSignature(a: *const Function, b: *const Function) bool {
+    fn sameSignature(s: *const Sema, a: *const Function, b: *const Function) bool {
         if (a.params.len != b.params.len) return false;
         for (a.params, b.params) |x, y| {
             // Unresolved parameter types (templates) never collide.
             if (x.type == TypeTable.error_type or y.type == TypeTable.error_type) return false;
-            if (x.type != y.type or x.dir != y.dir or x.groupshared != y.groupshared) return false;
+            if (!s.types.same(x.type, y.type) or x.dir != y.dir or x.groupshared != y.groupshared) return false;
         }
         return true;
     }
@@ -3441,7 +3493,7 @@ pub const Sema = struct {
             }
         }
         if (t.ty == TypeTable.error_type or f.ty == TypeTable.error_type) return err_typed;
-        if (t.ty == f.ty) return rvalue(t.ty);
+        if (s.types.same(t.ty, f.ty)) return rvalue(if (t.ty == f.ty) t.ty else s.types.canonical(t.ty));
         if (s.types.isNumeric(t.ty) and s.types.isNumeric(f.ty)) {
             return rvalue(s.arithmetic(e, t.ty, f.ty) orelse return err_typed);
         }
@@ -3453,7 +3505,7 @@ pub const Sema = struct {
     /// result takes the shape of all three operands.
     fn legacyConditional(s: *Sema, e: *ast.Expr, c: Typed, t: Typed, f: Typed) Allocator.Error!Typed {
         if (c.ty == TypeTable.error_type or t.ty == TypeTable.error_type or f.ty == TypeTable.error_type) return err_typed;
-        const r = if (t.ty == f.ty) t.ty else if (s.types.isNumeric(t.ty) and s.types.isNumeric(f.ty))
+        const r = if (t.ty == f.ty) t.ty else if (s.types.same(t.ty, f.ty)) s.types.canonical(t.ty) else if (s.types.isNumeric(t.ty) and s.types.isNumeric(f.ty))
             s.arithmetic(e, t.ty, f.ty) orelse return err_typed
         else {
             s.err(e.loc, "incompatible operand types ('{s}' and '{s}')", .{ s.typeName(t.ty), s.typeName(f.ty) });
@@ -3478,7 +3530,7 @@ pub const Sema = struct {
     fn sizeInfo(s: *Sema, ty: TypeId) u32 {
         if (ty == TypeTable.error_type) return 0;
         if (s.types.get(ty) == .@"struct" and s.types.get(ty).@"struct".invalid) return 2;
-        const size = layout.sizeOf(&s.types, ty, false, .dx_packed) catch return 0;
+        const size = layout.sizeOf(&s.types, ty, .dx_packed) catch return 0;
         return size + 1;
     }
 
@@ -3935,18 +3987,118 @@ pub const Sema = struct {
         var explicit: ?TypeId = null;
         if (template_args.len > 0) explicit = try s.typeArg(template_args[0]);
         const r = try s.intrinsic_db.resolve(s, e.loc, if (s.opts.spirv and isVkQualified(callee)) "VkIntrinsics" else "Intrinsics", name, null, arg_types, explicit);
-        if (r.ok) {
-            s.record(e, .{ .intrinsic = .{ .index = r.index, .params = r.params } });
-            // `dot(float4, float3)`: the longer argument is truncated.
-            for (arg_types, r.params[0..@min(arg_types.len, r.params.len)], 0..) |a, pt, i| {
-                const as = s.types.shape(a.ty) orelse continue;
-                const ps = s.types.shape(pt) orelse continue;
-                if (as.kind == .scalar or ps.kind == .scalar or (ps.rows >= as.rows and ps.cols >= as.cols)) continue;
-                const loc = if (e.kind == .call and i < e.kind.call.args.len) startLoc(e.kind.call.args[i]) else a.loc;
-                s.warn(loc, "conversion", "implicit truncation of vector type", .{});
-            }
+        if (!r.ok) return rvalue(r.ret);
+        // `dot(float4, float3)`: the longer argument is truncated.
+        for (arg_types, r.params[0..@min(arg_types.len, r.params.len)], 0..) |a, pt, i| {
+            const as = s.types.shape(a.ty) orelse continue;
+            const ps = s.types.shape(pt) orelse continue;
+            if (as.kind == .scalar or ps.kind == .scalar or (ps.rows >= as.rows and ps.cols >= as.cols)) continue;
+            const loc = if (e.kind == .call and i < e.kind.call.args.len) startLoc(e.kind.call.args[i]) else a.loc;
+            s.warn(loc, "conversion", "implicit truncation of vector type", .{});
         }
-        return rvalue(r.ret);
+        var raw_buffer: ?RawBuffer = null;
+        var ret = r.ret;
+        if (s.opts.spirv and isVkQualified(callee) and e.kind == .call) if (RawBufferAccess.of(name)) |acc| {
+            raw_buffer = try s.rawBuffer(e, acc, r, arg_types, if (template_args.len > 0) template_args[0] else null);
+            // A load's value is the memory's.
+            if (acc == .load) if (raw_buffer) |rb| {
+                ret = rb.ty;
+            };
+        };
+        s.record(e, .{ .intrinsic = .{ .index = r.index, .params = r.params, .raw_buffer = raw_buffer } });
+        return rvalue(ret);
+    }
+
+    /// Checks vk::RawBufferLoad<T>(addr[, alignment]) /
+    /// RawBufferStore<T>(addr, value[, alignment]): null after an error.
+    /// The memory's type is T: as the template argument writes it (or the
+    /// pragma there), else (a store inferring it) as the stored value's
+    /// type has it, its matrices otherwise oriented by -Zpr.
+    fn rawBuffer(s: *Sema, e: *ast.Expr, acc: RawBufferAccess, r: intrinsics.Db.Resolved, arg_types: []const intrinsics.ArgInfo, template_arg: ?ast.TemplateArg) Allocator.Error!?RawBuffer {
+        const args = e.kind.call.args;
+        var ty = try s.declaredType(if (acc == .store) r.params[1] else r.ret, if (template_arg) |ta| if (ta == .type) ta.type else null else null);
+        // (A literal stored is stored as its concrete type.)
+        if (s.types.component(ty)) |c| if (c.isLiteral()) {
+            ty = try s.types.withComponent(ty, c.concrete());
+        };
+        // A vector address converts to its first component: a `uint2`
+        // address is a mistake.
+        if (arg_types.len > 0) if (s.types.shape(arg_types[0].ty)) |sh| if (sh.count() > 1) {
+            s.warn(startLoc(args[0]), "conversion", "implicit truncation of vector type", .{});
+        };
+        switch (s.rawBufferAlignment(acc, ty, args)) {
+            .ok => |al| return .{ .ty = ty, .alignment = al },
+            .bad_type => s.err(e.loc, "cannot access a value of type '{s}' at an address", .{s.typeName(ty)}),
+            .not_constant => s.err(startLoc(args[acc.alignmentArg()]), "alignment argument must be a constant unsigned integer", .{}),
+            .not_power_of_two => s.err(startLoc(args[acc.alignmentArg()]), "alignment argument must be a power of two", .{}),
+            .too_large => s.err(startLoc(args[acc.alignmentArg()]), "alignment argument must fit in 32 bits", .{}),
+            .too_small => |min| s.err(startLoc(args[acc.alignmentArg()]), "alignment argument must be at least {d}, the size of the largest scalar accessed", .{min}),
+        }
+        return null;
+    }
+
+    pub const RawBufferAccess = enum {
+        load,
+        store,
+
+        /// vk::RawBufferLoad / vk::RawBufferStore by intrinsic name.
+        pub fn of(name: []const u8) ?RawBufferAccess {
+            return if (std.mem.eql(u8, name, "RawBufferLoad")) .load else if (std.mem.eql(u8, name, "RawBufferStore")) .store else null;
+        }
+
+        pub fn alignmentArg(acc: RawBufferAccess) usize {
+            return switch (acc) {
+                .load => 1,
+                .store => 2,
+            };
+        }
+    };
+
+    const RawBufferAlignment = union(enum) {
+        ok: u32,
+        /// Not plain data (a resource, ...).
+        bad_type,
+        not_constant,
+        not_power_of_two,
+        /// Above 32 bits (the Aligned literal's width).
+        too_large,
+        /// Below the size of the largest scalar accessed.
+        too_small: u32,
+    };
+
+    /// A resource or sampler, or a struct or array with one in it.
+    fn holdsResource(t: *const TypeTable, ty: TypeId) bool {
+        return switch (t.get(ty)) {
+            .resource, .sampler => true,
+            .array => |a| holdsResource(t, a.elem),
+            .@"struct" => |st| for (st.fields.items) |f| {
+                if (holdsResource(t, f.type)) break true;
+            } else false,
+            else => false,
+        };
+    }
+
+    /// The alignment of vk::RawBufferLoad<T>(addr[, alignment]) /
+    /// RawBufferStore<T>(addr, value[, alignment]) accessing `ty`. Vulkan
+    /// requires it at least the size of the largest scalar accessed
+    /// (VUID-StandaloneSpirv-PhysicalStorageBuffer64-06314) and a power of
+    /// two. An explicit one is a constant (as in dxc). The default is that
+    /// largest scalar size: the least the data needs (as newer dxc), never
+    /// more than it has (dxc 1.10's 4 claims too much for 16-bit types and
+    /// too little for 64-bit ones).
+    fn rawBufferAlignment(s: *Sema, acc: RawBufferAccess, ty: TypeId, args: []const *ast.Expr) RawBufferAlignment {
+        if (holdsResource(&s.types, ty)) return .bad_type;
+        // (Scalar rules: the alignment is the largest scalar's size, bools
+        // counting as uints.)
+        const min = layout.alignOf(&s.types, ty, .scalar) catch return .bad_type;
+        const at = acc.alignmentArg();
+        if (args.len <= at) return .{ .ok = min };
+        const c = s.evalConst(args[at]) orelse return .not_constant;
+        if (c != .int or c.int < 0) return .not_constant;
+        if (c.int > std.math.maxInt(u32)) return .too_large;
+        if (c.int == 0 or !std.math.isPowerOfTwo(c.int)) return .not_power_of_two;
+        if (c.int < min) return .{ .too_small = min };
+        return .{ .ok = @intCast(c.int) };
     }
 
     /// The cost of calling `f` with `args`, or null if it cannot take them.
@@ -4015,7 +4167,7 @@ pub const Sema = struct {
 
     /// Cost of an implicit conversion (0: exact), or null if impossible.
     pub fn conversionCost(s: *Sema, from: TypeId, to: TypeId) ?u32 {
-        if (from == to or from == TypeTable.error_type or to == TypeTable.error_type) return 0;
+        if (s.types.same(from, to) or from == TypeTable.error_type or to == TypeTable.error_type) return 0;
         const ft = s.types.get(from);
         const tt = s.types.get(to);
         const fc = s.types.component(from);

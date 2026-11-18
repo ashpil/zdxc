@@ -172,6 +172,8 @@ const Emitter = struct {
     /// array) and stride: one type per layout, as in dxc.
     strided_arrays: std.AutoHashMapUnmanaged([3]u32, Id) = .empty,
     layout_types: std.AutoHashMapUnmanaged(LayoutKey, Id) = .empty,
+    /// Structs around float matrices at addresses (rawBufferWrapper).
+    raw_wrappers: std.AutoHashMapUnmanaged(LayoutKey, Id) = .empty,
     /// Per instruction (current function): the buffer layout its pointer
     /// result points into, if any.
     ptr_layouts: []?PtrLayout = &.{},
@@ -248,7 +250,8 @@ const Emitter = struct {
     nonuniform_ids: std.AutoHashMapUnmanaged(Id, void) = .empty,
     /// -fspv-fusemuladd: the operands and type of each OpFMul.
     fmuls: std.AutoHashMapUnmanaged(Id, struct { a: Id, b: Id, ty: TypeId }) = .empty,
-    variants: std.ArrayList(struct { fi: u32, bindings: []const Id, id: Id }) = .empty,
+    /// `types`: per binding, the type it is bound as (bindingType).
+    variants: std.ArrayList(struct { fi: u32, bindings: []const Id, types: []const TypeId, id: Id }) = .empty,
     /// The current function's block labels, and phi operands (word
     /// positions in the functions section) naming values emitted after the
     /// phi, patched when the function is done.
@@ -264,6 +267,8 @@ const Emitter = struct {
     undef_ids: std.AutoHashMapUnmanaged(TypeId, Id) = .empty,
     /// The bindings of the function being emitted (a specialization).
     cur_bindings: []const Id = &.{},
+    /// Their types (bindingType; 0 for other parameters).
+    cur_binding_types: []const TypeId = &.{},
     /// Per instruction (current function): resource locals assigned
     /// elements of one resource array, kept as their indices.
     indexed_locals: std.AutoHashMapUnmanaged(u32, IndexedLocal) = .empty,
@@ -335,11 +340,18 @@ const Emitter = struct {
         indices_var: Id = 0,
         payload_var: Id = 0,
     };
-    const LayoutKey = struct { TypeId, layout.Rules, bool };
+    const LayoutKey = struct { TypeId, layout.Rules };
     const MeshPlace = struct { kind: ir.MeshOutput, index: Ref = .none, offset: u32 = 0, ty: TypeId };
     /// `buffer`: storage buffer storage (structured buffers, tbuffers), not
     /// Uniform (constant buffers).
-    const PtrLayout = struct { rules: layout.Rules, row_major: bool, buffer: bool = false };
+    /// `ty`: the type of the memory the pointer points at, its matrices
+    /// oriented as stored, which lays it out (a buffer's are its
+    /// binding's: the IR pointer's type may orient them otherwise, as
+    /// through a parameter declared with other orientations).
+    /// `aligned`: the Aligned memory operand of loads and stores through
+    /// the pointer (PhysicalStorageBuffer ones). `wrapper`: the struct the
+    /// pointer points at, the value its only member (rawBufferWrapper).
+    const PtrLayout = struct { ty: TypeId, rules: layout.Rules, buffer: bool = false, aligned: ?u32 = null, wrapper: ?Id = null };
 
     fn unsupported(e: *Emitter, comptime fmt: []const u8, args: anytype) Error {
         _ = e.diags.report(.{ .severity = .@"error", .loc = .none }, "SPIR-V code generation: " ++ fmt, args);
@@ -387,7 +399,12 @@ const Emitter = struct {
 
     fn typeId(e: *Emitter, ty: TypeId) Error!Id {
         if (e.value_types.get(ty)) |id| return id;
-        const id: Id = switch (e.t.get(ty)) {
+        // (SPIR-V types have no storage order: buffers' members are
+        // decorated with it, layoutTypeId. Memory that has none of its own,
+        // a local or a plain struct's field declared row_major, is of the
+        // canonical type.)
+        const c = e.t.canonical(ty);
+        const id: Id = if (c != ty) try e.typeId(c) else switch (e.t.get(ty)) {
             .void => blk: {
                 const id = e.b.newId();
                 try e.b.emit(.types_globals, .type_void, &.{id});
@@ -533,7 +550,7 @@ const Emitter = struct {
     /// `ty` laid out for a buffer (`rules`): arrays carry ArrayStride,
     /// structs member Offsets and matrix decorations; scalars, vectors and
     /// float matrices are the plain types (bools become uints).
-    fn layoutTypeId(e: *Emitter, ty: TypeId, rules: layout.Rules, row_major: bool) Error!Id {
+    fn layoutTypeId(e: *Emitter, ty: TypeId, rules: layout.Rules) Error!Id {
         switch (e.t.get(ty)) {
             .scalar, .vector, .@"enum" => return e.typeId(if (e.t.component(ty) == .bool) try e.t.withComponent(ty, .uint) else ty),
             .matrix => |m| {
@@ -541,23 +558,23 @@ const Emitter = struct {
                 if (m.rows == 1 or m.cols == 1) {
                     // A SPIR-V vector: contiguous only if the stored vectors
                     // are the whole matrix or single components packed tight.
-                    const vectors: u32 = if (row_major) m.rows else m.cols;
-                    if (vectors > 1 and layout.matrixStride(e.t, ty, row_major, rules) != storageScalar(m.elem).size()) {
+                    const vectors: u32 = if (m.orientation == .row_major) m.rows else m.cols;
+                    if (vectors > 1 and layout.matrixStride(e.t, ty, rules) != storageScalar(m.elem).size()) {
                         return e.unsupported("this 1xN / Nx1 matrix layout is not supported yet", .{});
                     }
                     return e.typeId(ty);
                 }
                 if (fl) return e.typeId(ty);
-                if (!row_major) return e.unsupported("column-major integer matrices in buffers are not supported yet", .{});
+                if (m.orientation != .row_major) return e.unsupported("column-major integer matrices in buffers are not supported yet", .{});
             },
             else => {},
         }
-        const key: LayoutKey = .{ ty, rules, row_major };
+        const key: LayoutKey = .{ ty, rules };
         if (e.layout_types.get(key)) |id| return id;
         const id = switch (e.t.get(ty)) {
             // Row-major integer matrix: an array of its rows.
-            .matrix => |m| try e.stridedArray(try e.layoutTypeId(try e.t.vector(m.elem, m.cols), rules, false), m.rows, layout.matrixStride(e.t, ty, true, rules)),
-            .array => |a| try e.stridedArray(try e.layoutTypeId(a.elem, rules, row_major), a.len, layout.arrayStride(e.t, a.elem, row_major, rules) catch return e.unsupported("buffer member type", .{})),
+            .matrix => |m| try e.stridedArray(try e.layoutTypeId(try e.t.vector(m.elem, m.cols), rules), m.rows, layout.matrixStride(e.t, ty, rules)),
+            .array => |a| try e.stridedArray(try e.layoutTypeId(a.elem, rules), a.len, layout.arrayStride(e.t, a.elem, rules) catch return e.unsupported("buffer member type", .{})),
             .@"struct" => |st| blk: {
                 const id = e.b.newId();
                 try e.layoutStruct(id, st, rules, st.name);
@@ -566,6 +583,30 @@ const Emitter = struct {
             else => return e.unsupported("buffer members of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)}),
         };
         try e.layout_types.put(e.arena, key, id);
+        return id;
+    }
+
+    /// For a float matrix (or array of them) at an address, a struct
+    /// holding it as its only member: SPIR-V decorates a matrix's
+    /// MatrixStride and majorness only as a member, and a matrix pointee
+    /// without them has no defined layout. Null for other types.
+    fn rawBufferWrapper(e: *Emitter, ty: TypeId, rules: layout.Rules) Error!?Id {
+        var inner = ty;
+        while (e.t.get(inner) == .array) inner = e.t.get(inner).array.elem;
+        if (!e.isTrueMatrix(inner) or !storageScalar(e.t.get(inner).matrix.elem).isFloat()) return null;
+        const key: LayoutKey = .{ ty, rules };
+        if (e.raw_wrappers.get(key)) |id| return id;
+        const id = e.b.newId();
+        try e.b.emit(.types_globals, .type_struct, &.{ id, try e.layoutTypeId(ty, rules) });
+        try e.b.emit(.annotations, .member_decorate, &.{ id, 0, 35, 0 }); // Offset 0
+        // HLSL rows are SPIR-V columns, so column_major is RowMajor.
+        try e.b.emit(.annotations, .member_decorate, &.{ id, 0, 7, layout.matrixStride(e.t, inner, rules) }); // MatrixStride
+        try e.b.emit(.annotations, .member_decorate, &.{ id, 0, if (e.t.isRowMajor(inner)) 5 else 4 }); // ColMajor / RowMajor
+        var label: []const u8 = try e.typeLabel(inner);
+        var dims = ty;
+        while (e.t.get(dims) == .array) : (dims = e.t.get(dims).array.elem) label = try std.fmt.allocPrint(e.arena, "{s}[{d}]", .{ label, e.t.get(dims).array.len });
+        try e.b.emitWithString(.debug_names, .name, &.{id}, try std.fmt.allocPrint(e.arena, "type.RawBuffer.{s}", .{label}), &.{});
+        try e.raw_wrappers.put(e.arena, key, id);
         return id;
     }
 
@@ -591,12 +632,12 @@ const Emitter = struct {
                 try ops.append(e.arena, id);
                 // (Resources in structs are not members of the SPIR-V
                 // struct: they are their own variables.)
-                for (st.fields.items) |fld| if (!layout.isOpaque(e.t, fld.type)) try ops.append(e.arena, try e.layoutTypeId(fld.type, rules, fld.row_major));
+                for (st.fields.items) |fld| if (!layout.isOpaque(e.t, fld.type)) try ops.append(e.arena, try e.layoutTypeId(fld.type, rules));
                 try e.b.emit(.types_globals, .type_struct, ops.items);
                 const offs = layout.fieldOffsets(e.arena, e.t, st, rules) catch return e.unsupported("buffer member type '{s}'", .{st.name});
                 // An explicit [[vk::offset]] still has to respect the rules.
                 for (st.fields.items, offs) |fld, o| if (fld.vk_offset != null) {
-                    const al = layout.alignOf(e.t, fld.type, fld.row_major, rules) catch 1;
+                    const al = layout.alignOf(e.t, fld.type, rules) catch 1;
                     const need: u32 = switch (e.t.get(fld.type)) {
                         .scalar, .@"enum", .vector => 1,
                         else => al,
@@ -617,8 +658,8 @@ const Emitter = struct {
                     var inner = fld.type;
                     while (e.t.get(inner) == .array) inner = e.t.get(inner).array.elem;
                     if (e.isTrueMatrix(inner) and storageScalar(e.t.get(inner).matrix.elem).isFloat()) {
-                        try e.b.emit(.annotations, .member_decorate, &.{ id, mk, 7, layout.matrixStride(e.t, inner, fld.row_major, rules) }); // MatrixStride
-                        try e.b.emit(.annotations, .member_decorate, &.{ id, mk, if (fld.row_major) 5 else 4 }); // ColMajor / RowMajor
+                        try e.b.emit(.annotations, .member_decorate, &.{ id, mk, 7, layout.matrixStride(e.t, inner, rules) }); // MatrixStride
+                        try e.b.emit(.annotations, .member_decorate, &.{ id, mk, if (e.t.isRowMajor(inner)) 5 else 4 }); // ColMajor / RowMajor
                     }
                     try e.b.emitWithString(.debug_names, .member_name, &.{ id, mk }, fld.name, &.{});
                 }
@@ -671,16 +712,16 @@ const Emitter = struct {
     }
 
     /// A value loaded with a buffer layout, as the plain type.
-    fn fromLayout(e: *Emitter, v: Id, ty: TypeId, rules: layout.Rules, row_major: bool) Error!Id {
-        return e.relayout(v, ty, rules, row_major, true);
+    fn fromLayout(e: *Emitter, v: Id, ty: TypeId, rules: layout.Rules) Error!Id {
+        return e.relayout(v, ty, rules, true);
     }
 
-    fn toLayout(e: *Emitter, v: Id, ty: TypeId, rules: layout.Rules, row_major: bool) Error!Id {
-        return e.relayout(v, ty, rules, row_major, false);
+    fn toLayout(e: *Emitter, v: Id, ty: TypeId, rules: layout.Rules) Error!Id {
+        return e.relayout(v, ty, rules, false);
     }
 
-    fn relayout(e: *Emitter, v: Id, ty: TypeId, rules: layout.Rules, row_major: bool, from: bool) Error!Id {
-        const lt = try e.layoutTypeId(ty, rules, row_major);
+    fn relayout(e: *Emitter, v: Id, ty: TypeId, rules: layout.Rules, from: bool) Error!Id {
+        const lt = try e.layoutTypeId(ty, rules);
         const pt = try e.typeId(ty);
         switch (e.t.get(ty)) {
             .scalar, .vector, .@"enum" => {
@@ -693,29 +734,29 @@ const Emitter = struct {
                 // Row-major integer matrix <-> array of rows.
                 const rows = try e.arena.alloc(u32, m.rows);
                 const row_ty = try e.t.vector(m.elem, m.cols);
-                const src_row = if (from) try e.layoutTypeId(row_ty, rules, false) else try e.typeId(row_ty);
+                const src_row = if (from) try e.layoutTypeId(row_ty, rules) else try e.typeId(row_ty);
                 for (rows, 0..) |*rw, k| {
                     const el = try e.opRaw(.composite_extract, src_row, &.{ v, @intCast(k) });
-                    rw.* = try e.relayout(el, row_ty, rules, false, from);
+                    rw.* = try e.relayout(el, row_ty, rules, from);
                 }
                 return e.opRaw(.composite_construct, if (from) pt else lt, rows);
             },
             .array => |a| {
                 if (lt == pt) return v;
                 const parts = try e.arena.alloc(u32, a.len);
-                const src_el = if (from) try e.layoutTypeId(a.elem, rules, row_major) else try e.typeId(a.elem);
+                const src_el = if (from) try e.layoutTypeId(a.elem, rules) else try e.typeId(a.elem);
                 for (parts, 0..) |*p, k| {
                     const el = try e.opRaw(.composite_extract, src_el, &.{ v, @intCast(k) });
-                    p.* = try e.relayout(el, a.elem, rules, row_major, from);
+                    p.* = try e.relayout(el, a.elem, rules, from);
                 }
                 return e.opRaw(.composite_construct, if (from) pt else lt, parts);
             },
             .@"struct" => |st| {
                 const parts = try e.arena.alloc(u32, st.fields.items.len);
                 for (st.fields.items, parts, 0..) |fld, *p, k| {
-                    const src_el = if (from) try e.layoutTypeId(fld.type, rules, fld.row_major) else try e.typeId(fld.type);
+                    const src_el = if (from) try e.layoutTypeId(fld.type, rules) else try e.typeId(fld.type);
                     const el = try e.opRaw(.composite_extract, src_el, &.{ v, @intCast(k) });
-                    p.* = try e.relayout(el, fld.type, rules, fld.row_major, from);
+                    p.* = try e.relayout(el, fld.type, rules, from);
                 }
                 return e.opRaw(.composite_construct, if (from) pt else lt, parts);
             },
@@ -884,7 +925,7 @@ const Emitter = struct {
         for (e.m.globals.items, 0..) |g, gi| {
             if (g.space != .resource or e.global_vars[gi] == 0) continue;
             switch (e.t.get(g.ty)) {
-                .array => |arr| if (arr.elem == ty) return @intCast(gi),
+                .array => |arr| if (e.t.same(arr.elem, ty)) return @intCast(gi),
                 else => {},
             }
         }
@@ -893,7 +934,7 @@ const Emitter = struct {
 
     fn anyGlobalOf(e: *Emitter, ty: TypeId) ?u32 {
         for (e.m.globals.items, 0..) |g, gi| {
-            if (g.ty == ty and g.space == .resource and e.global_vars[gi] != 0) return @intCast(gi);
+            if (e.t.same(g.ty, ty) and g.space == .resource and e.global_vars[gi] != 0) return @intCast(gi);
         }
         return null;
     }
@@ -1019,13 +1060,13 @@ const Emitter = struct {
         for (m.functions.items, e.func_ids) |f, id| {
             if (f.dead) continue;
             e.setEntry(f.entry);
-            if (!e.hasResourceParams(f)) try e.emitFunction(f, id, &.{});
+            if (!e.hasResourceParams(f)) try e.emitFunction(f, id, &.{}, &.{});
         }
         var vi: usize = 0;
         while (vi < e.variants.items.len) : (vi += 1) {
             const v = e.variants.items[vi];
             e.setEntry(m.functions.items[v.fi].entry);
-            try e.emitFunction(m.functions.items[v.fi], v.id, v.bindings);
+            try e.emitFunction(m.functions.items[v.fi], v.id, v.bindings, v.types);
         }
         if (e.undef_resource_used) return e.unsupported("a resource local read before it is assigned", .{});
 
@@ -2041,7 +2082,7 @@ const Emitter = struct {
                     @memset(idx, 0);
                     const dyn_types = try e.arena.alloc(Id, il.types.len);
                     for (dyn_types, il.types) |*d, ty| d.* = try e.typeId(ty);
-                    const p_ = try e.resourcePointee(f.inst(x).ty);
+                    const p_ = try e.resourcePointee(e.bindingType(x));
                     const id = try e.addRecipe(.{ .var_id = e.val(il.global), .ptr_ty = try e.pointerType(p_.sc, p_.ty), .indices = idx, .dyn_types = dyn_types, .nonuniform = il.nonuniform, .res_ty = f.inst(x).ty });
                     return .{ .id = id, .dyn = il.indices };
                 }
@@ -2056,7 +2097,7 @@ const Emitter = struct {
             .heap_resource => |h| {
                 // A heap element at a constant index.
                 if (f.inst(h.index).op != .constant) return e.unsupported("passing a resource from a descriptor heap at a dynamic index to a function is not supported yet", .{});
-                const p = try e.resourcePointee(f.inst(x).ty);
+                const p = try e.resourcePointee(e.bindingType(x));
                 const hv = e.heap_vars.get(.{ h.sampler, p.ty }) orelse return e.unsupported("internal: heap variable missing", .{});
                 return .{ .id = try e.addRecipe(.{ .var_id = hv, .ptr_ty = try e.pointerType(p.sc, p.ty), .indices = try e.arena.dupe(Id, &.{e.val(h.index)}) }) };
             },
@@ -2163,19 +2204,21 @@ const Emitter = struct {
         return recipe_tag | @as(Id, @intCast(e.recipes.items.len - 1));
     }
 
-    fn variantFor(e: *Emitter, fi: u32, bindings: []const Id) Error!Id {
+    /// (A binding is bound as one type: `types` follow from `bindings`.)
+    fn variantFor(e: *Emitter, fi: u32, bindings: []const Id, binding_types: []const TypeId) Error!Id {
         for (e.variants.items) |v| if (v.fi == fi and std.mem.eql(Id, v.bindings, bindings)) return v.id;
         const id = e.b.newId();
-        try e.variants.append(e.arena, .{ .fi = fi, .bindings = try e.arena.dupe(Id, bindings), .id = id });
+        try e.variants.append(e.arena, .{ .fi = fi, .bindings = try e.arena.dupe(Id, bindings), .types = try e.arena.dupe(TypeId, binding_types), .id = id });
         try e.b.emitWithString(.debug_names, .name, &.{id}, e.m.functions.items[fi].name, &.{});
         return id;
     }
 
-    fn emitFunction(e: *Emitter, f: *const ir.Function, fn_id: Id, bindings: []const Id) Error!void {
+    fn emitFunction(e: *Emitter, f: *const ir.Function, fn_id: Id, bindings: []const Id, binding_types: []const TypeId) Error!void {
         e.f = f;
         e.cur_fn = fn_id;
         defer e.cur_fn = 0;
         e.cur_bindings = bindings;
+        e.cur_binding_types = binding_types;
         e.texel_places = .empty;
         e.mesh_places = .empty;
         e.indexed_locals = .empty;
@@ -2519,6 +2562,18 @@ const Emitter = struct {
             .constant, .param, .local_var => {},
             .node_io => return e.unsupported("work graph nodes are not supported in SPIR-V", .{}),
             .spec_constant => |k| e.vals[ri] = try e.specConstant(k),
+            .address => |x| {
+                // A PhysicalStorageBuffer pointer, its pointee laid out as
+                // storage buffers are (dxc's sBufferLayoutRule: relaxed
+                // std430 by default, following -fvk-*-layout; bools as
+                // uints).
+                try e.inlineCap(5347); // PhysicalStorageBufferAddresses
+                const rules = e.sbRules();
+                const wrapper = try e.rawBufferWrapper(i.ty, rules);
+                const pt = try e.pointerType(.physical_storage_buffer, wrapper orelse try e.layoutTypeId(i.ty, rules));
+                e.vals[ri] = try e.opRaw(.bitcast, pt, &.{e.val(x.addr)});
+                e.ptr_layouts[ri] = .{ .ty = i.ty, .rules = rules, .aligned = x.alignment, .wrapper = wrapper };
+            },
             .spirv_inst => |x| e.vals[ri] = try e.spirvInst(x, i.ty),
             .ray_incoming => |k| e.vals[ri] = try e.rayVar(switch (k) {
                 .payload => .incoming_ray_payload_khr,
@@ -2531,12 +2586,12 @@ const Emitter = struct {
                 if (ownStorage(e.m.globals.items[g]) != null) {
                     // (Interfaces list them from SPIR-V 1.4.)
                     if (e.spv_minor >= 4) try e.useVar(e.global_vars[g]);
-                    e.ptr_layouts[ri] = .{ .rules = e.sbRules(), .row_major = false };
+                    e.ptr_layouts[ri] = .{ .ty = i.ty, .rules = e.sbRules() };
                     return;
                 }
                 e.ptr_layouts[ri] = switch (e.m.globals.items[g].space) {
-                    .cbuffer => if (e.m.globals.items[g].tbuffer) .{ .rules = e.tbRules(), .row_major = false, .buffer = true } else .{ .rules = e.globalCbRules(e.m.globals.items[g]), .row_major = false },
-                    .resource => .{ .rules = e.sbRules(), .row_major = bufferRowMajor(e.t, e.m.globals.items[g].ty), .buffer = true },
+                    .cbuffer => if (e.m.globals.items[g].tbuffer) .{ .ty = i.ty, .rules = e.tbRules(), .buffer = true } else .{ .ty = i.ty, .rules = e.globalCbRules(e.m.globals.items[g]) },
+                    .resource => .{ .ty = i.ty, .rules = e.sbRules(), .buffer = true },
                     else => null,
                 };
             },
@@ -2557,7 +2612,7 @@ const Emitter = struct {
                         const idx = try e.arena.alloc(Id, il.vars.len);
                         for (idx, il.vars, il.index_types) |*d, v, ty| d.* = try e.op1(.load, ty, &.{v});
                         e.format_override = e.formatFor(il.global);
-                        const pt = try e.resourcePointee(i.ty);
+                        const pt = try e.resourcePointee(elemType(e.t, f.inst(il.global).ty, il.vars.len));
                         e.format_override = null;
                         var ops: std.ArrayList(u32) = .empty;
                         const id = e.b.newId();
@@ -2596,7 +2651,7 @@ const Emitter = struct {
                                 // ShaderPrint buffers left unset): their
                                 // first element.
                                 if (e.spv_minor >= 4) try e.useVar(e.global_vars[g]);
-                                const pt = try e.resourcePointee(i.ty);
+                                const pt = try e.resourcePointee(e.t.get(e.m.globals.items[g].ty).array.elem);
                                 stand_in = try e.opRaw(.access_chain, try e.pointerType(pt.sc, pt.ty), &.{ e.global_vars[g], try e.constInt(0) });
                             }
                             e.vals[ri] = 0;
@@ -2609,8 +2664,14 @@ const Emitter = struct {
                     return;
                 }
                 if (e.ptr_layouts[p.index()]) |pl| {
-                    const raw = try e.opRaw(.load, try e.layoutTypeId(i.ty, pl.rules, pl.row_major), &.{e.val(p)});
-                    e.vals[ri] = try e.fromLayout(raw, i.ty, pl.rules, pl.row_major);
+                    // (Laid out as the memory is.)
+                    const mem = pl.ty;
+                    const lt = try e.layoutTypeId(mem, pl.rules);
+                    const raw = if (pl.aligned) |al| blk: {
+                        const v = try e.opRaw(.load, pl.wrapper orelse lt, &.{ e.val(p), 2, al }); // Aligned
+                        break :blk if (pl.wrapper != null) try e.opRaw(.composite_extract, lt, &.{ v, 0 }) else v;
+                    } else try e.opRaw(.load, lt, &.{e.val(p)});
+                    e.vals[ri] = try e.fromLayout(raw, mem, pl.rules);
                     return;
                 }
                 e.vals[ri] = try e.op1(.load, i.ty, &.{e.val(p)});
@@ -2665,8 +2726,13 @@ const Emitter = struct {
                     return;
                 }
                 if (e.ptr_layouts[s.ptr.index()]) |pl| {
-                    const v = try e.toLayout(e.val(s.value), f.inst(s.value).ty, pl.rules, pl.row_major);
-                    try e.b.emit(.functions, .store, &.{ e.val(s.ptr), v });
+                    // (Laid out as the memory is.)
+                    var v = try e.toLayout(e.val(s.value), pl.ty, pl.rules);
+                    if (pl.wrapper) |w| v = try e.opRaw(.composite_construct, w, &.{v});
+                    if (pl.aligned) |al|
+                        try e.b.emit(.functions, .store, &.{ e.val(s.ptr), v, 2, al }) // Aligned
+                    else
+                        try e.b.emit(.functions, .store, &.{ e.val(s.ptr), v });
                     return;
                 }
                 try e.b.emit(.functions, .store, &.{ e.val(s.ptr), e.val(s.value) });
@@ -2685,6 +2751,9 @@ const Emitter = struct {
                     try e.texel_places.put(e.arena, ri, .{ .res = a.base, .coord = a.indices[0] });
                     return;
                 }
+                // (Lowering accesses memory at addresses whole; a part's
+                // Aligned operand would follow from its offset.)
+                if (i.ptr == .physical) return e.unsupported("access chains into memory at an address", .{});
                 // Buffers reached through locals or parameters are still
                 // Uniform std430 storage.
                 const into_buffer = e.t.get(f.inst(a.base).ty) == .resource;
@@ -2732,10 +2801,11 @@ const Emitter = struct {
                     .cbuffer, .resource => .uniform,
                     else => return e.unsupported("access into this storage is not supported yet", .{}),
                 };
-                var pl = if (shader_record) PtrLayout{ .rules = e.sbRules(), .row_major = false } else if (into_cb) PtrLayout{ .rules = e.cbRules(), .row_major = false } else if (into_tb) PtrLayout{ .rules = e.tbRules(), .row_major = false, .buffer = true } else if (into_buffer) PtrLayout{ .rules = e.sbRules(), .row_major = bufferRowMajor(e.t, f.inst(a.base).ty), .buffer = true } else e.ptr_layouts[a.base.index()];
                 var ops: std.ArrayList(u32) = .empty;
                 try ops.appendSlice(e.arena, &.{ 0, 0, e.val(a.base) });
-                var cur = f.inst(a.base).ty;
+                // The memory's type, walked down the indices: its own
+                // orientations lay it out (a buffer's are its binding's).
+                var cur = if (base_pl) |bp| bp.ty else if (into_buffer) e.bindingType(a.base) else f.inst(a.base).ty;
                 var indices = a.indices;
                 if (into_cb or into_tb) {
                     cur = e.t.get(cur).resource.elem;
@@ -2760,7 +2830,6 @@ const Emitter = struct {
                             if (k.op != .constant) break :blk cur;
                             const fi: u32 = @intCast(k.op.constant.int);
                             const fld = st.fields.items[fi];
-                            if (pl) |*p| p.row_major = fld.row_major;
                             // (Resource members are not in the SPIR-V
                             // struct: later members move up.)
                             if (dataIndex(e.t, st, fi) != fi) {
@@ -2774,8 +2843,13 @@ const Emitter = struct {
                     };
                     if (!skip) try ops.append(e.arena, e.val(x));
                 }
+                const pl: ?PtrLayout = if (shader_record) .{ .ty = cur, .rules = e.sbRules() } else if (into_cb) .{ .ty = cur, .rules = e.cbRules() } else if (into_tb) .{ .ty = cur, .rules = e.tbRules(), .buffer = true } else if (into_buffer) .{ .ty = cur, .rules = e.sbRules(), .buffer = true } else if (base_pl) |bp| blk: {
+                    var p = bp;
+                    p.ty = cur;
+                    break :blk p;
+                } else null;
                 e.ptr_layouts[ri] = pl;
-                ops.items[0] = try e.pointerType(sc, if (pl) |p| try e.layoutTypeId(i.ty, p.rules, p.row_major) else try e.typeId(i.ty));
+                ops.items[0] = try e.pointerType(sc, if (pl) |p| try e.layoutTypeId(p.ty, p.rules) else try e.typeId(i.ty));
                 if (ops.items.len == 3) {
                     e.vals[ri] = e.val(a.base);
                     return;
@@ -2974,17 +3048,20 @@ const Emitter = struct {
                 const callee = e.m.functions.items[c.func];
                 if (e.hasResourceParams(callee)) {
                     const bindings = try e.arena.alloc(Id, c.args.len);
+                    const binding_types = try e.arena.alloc(TypeId, c.args.len);
                     var dyn: std.ArrayList(Id) = .empty;
-                    for (callee.params, c.args, bindings) |p, a, *bd| {
+                    for (callee.params, c.args, bindings, binding_types) |p, a, *bd, *bt| {
                         if (!isResourceType(e.t, p.ty)) {
                             bd.* = 0;
+                            bt.* = 0;
                             continue;
                         }
                         const b = try e.resourceBinding(a);
                         bd.* = b.id;
+                        bt.* = e.bindingType(a);
                         try dyn.appendSlice(e.arena, b.dyn);
                     }
-                    const vid = try e.variantFor(c.func, bindings);
+                    const vid = try e.variantFor(c.func, bindings, binding_types);
                     try e.recordCall(vid);
                     try ops.append(e.arena, vid);
                     for (callee.params, c.args) |p, a| if (!isResourceType(e.t, p.ty)) try ops.append(e.arena, e.val(a));
@@ -3032,8 +3109,10 @@ const Emitter = struct {
                     return;
                 }
                 const ptr = try e.bufferElement(x.res, x.index);
-                const raw = try e.opRaw(.load, try e.layoutTypeId(i.ty, e.sbRules(), false), &.{ptr});
-                e.vals[ri] = try e.fromLayout(raw, i.ty, e.sbRules(), false);
+                // (Laid out as the buffer's elements are.)
+                const elem = e.resourceInfo(x.res).elem;
+                const raw = try e.opRaw(.load, try e.layoutTypeId(elem, e.sbRules()), &.{ptr});
+                e.vals[ri] = try e.fromLayout(raw, elem, e.sbRules());
             },
             .res_store => |x| {
                 if (e.isImage(x.res)) {
@@ -3041,7 +3120,7 @@ const Emitter = struct {
                     return;
                 }
                 const ptr = try e.bufferElement(x.res, x.index);
-                const v = try e.toLayout(e.val(x.value), f.inst(x.value).ty, e.sbRules(), false);
+                const v = try e.toLayout(e.val(x.value), e.resourceInfo(x.res).elem, e.sbRules());
                 try e.b.emit(.functions, .store, &.{ ptr, v });
             },
             .method => |x| e.vals[ri] = try e.method(x.name, x.res, x.args, i.ty),
@@ -3074,7 +3153,8 @@ const Emitter = struct {
             .mesh_output => try e.mesh_places.put(e.arena, ri, .{ .kind = i.op.mesh_output, .ty = i.ty }),
             .heap_resource => |h| {
                 if (e.t.get(i.ty) != .resource and e.t.get(i.ty) != .sampler) return;
-                const p = try e.resourcePointee(i.ty);
+                // (A heap of resources bound as `decl` declares them.)
+                const p = try e.resourcePointee(h.decl);
                 const key = .{ h.sampler, p.ty };
                 const hv = e.heap_vars.get(key) orelse blk: {
                     try e.cap(.runtime_descriptor_array);
@@ -3474,22 +3554,13 @@ const Emitter = struct {
 
     /// Pointer to `buffer[index]` (structured / byte-address buffers).
     fn bufferElement(e: *Emitter, res: Ref, index: Ref) Error!Id {
-        const elem = (try e.bufferElemType(e.f.inst(res).ty)) orelse return e.unsupported("indexing this resource is not supported yet", .{});
+        const elem = (try e.bufferElemType(e.bindingType(res))) orelse return e.unsupported("indexing this resource is not supported yet", .{});
         const id = e.b.newId();
         try e.b.emit(.functions, .access_chain, &.{ try e.pointerType(e.bufferSc(), elem), id, e.val(res), try e.constInt(0), e.val(index) });
         return id;
     }
 
     /// The laid-out element type of a structured / byte-address buffer.
-    /// A structured buffer type's matrix elements are row_major.
-    fn bufferRowMajor(t: *TypeTable, ty: TypeId) bool {
-        return switch (t.get(ty)) {
-            .resource => |r| r.row_major,
-            .array => |a| bufferRowMajor(t, a.elem),
-            else => false,
-        };
-    }
-
     fn bufferElemType(e: *Emitter, ty: TypeId) Error!?Id {
         const r = switch (e.t.get(ty)) {
             .resource => |r| r,
@@ -3500,7 +3571,7 @@ const Emitter = struct {
             .structured_buffer, .rw_structured_buffer, .append_structured_buffer, .consume_structured_buffer => r.elem,
             else => return null,
         };
-        return try e.layoutTypeId(elem_ty, e.sbRules(), r.row_major);
+        return try e.layoutTypeId(elem_ty, e.sbRules());
     }
 
     /// The BufferBlock struct of a buffer type (one per HLSL type, so
@@ -3510,12 +3581,12 @@ const Emitter = struct {
         const r = e.t.get(ty).resource;
         const elem_ty = if (r.kind == .byte_address_buffer or r.kind == .rw_byte_address_buffer) try e.t.scalar(.uint) else r.elem;
         const elem = (try e.bufferElemType(ty)).?;
-        const stride = layout.arrayStride(e.t, elem_ty, r.row_major, e.sbRules()) catch return e.unsupported("buffer element type '{s}'", .{try e.t.format(e.arena, elem_ty)});
+        const stride = layout.arrayStride(e.t, elem_ty, e.sbRules()) catch return e.unsupported("buffer element type '{s}'", .{try e.t.format(e.arena, elem_ty)});
         if (e.vk.no_scalar_block_layout and r.kind != .byte_address_buffer and r.kind != .rw_byte_address_buffer) {
             // -fspv-no-scalar-block-layout (Epic's DXC): the element must
             // need no padding, as packed (FxcSBuffer) it has the same
             // stride.
-            const packed_stride = layout.arrayStride(e.t, elem_ty, r.row_major, .dx_packed) catch return e.unsupported("buffer element type", .{});
+            const packed_stride = layout.arrayStride(e.t, elem_ty, .dx_packed) catch return e.unsupported("buffer element type", .{});
             if (packed_stride != stride) {
                 _ = e.diags.report(.{ .severity = .@"error", .loc = .none }, "cannot instantiate {s} with given packed alignment; 'VK_EXT_scalar_block_layout' not supported", .{r.name});
                 return error.Unsupported;
@@ -3525,11 +3596,13 @@ const Emitter = struct {
         const st = e.b.newId();
         try e.b.emit(.types_globals, .type_struct, &.{ st, rt });
         try e.b.emit(.annotations, .member_decorate, &.{ st, 0, 35, 0 }); // Offset 0
-        if (e.isTrueMatrix(elem_ty) and storageScalar(e.t.get(elem_ty).matrix.elem).isFloat()) {
-            // Buffers of matrices: HLSL rows are SPIR-V columns, so
-            // column_major is RowMajor.
-            try e.b.emit(.annotations, .member_decorate, &.{ st, 0, 7, layout.matrixStride(e.t, elem_ty, r.row_major, e.sbRules()) }); // MatrixStride
-            try e.b.emit(.annotations, .member_decorate, &.{ st, 0, if (r.row_major) 5 else 4 }); // ColMajor / RowMajor
+        var inner = elem_ty;
+        while (e.t.get(inner) == .array) inner = e.t.get(inner).array.elem;
+        if (e.isTrueMatrix(inner) and storageScalar(e.t.get(inner).matrix.elem).isFloat()) {
+            // Buffers of matrices (or of arrays of them): HLSL rows are
+            // SPIR-V columns, so column_major is RowMajor.
+            try e.b.emit(.annotations, .member_decorate, &.{ st, 0, 7, layout.matrixStride(e.t, inner, e.sbRules()) }); // MatrixStride
+            try e.b.emit(.annotations, .member_decorate, &.{ st, 0, if (e.t.isRowMajor(inner)) 5 else 4 }); // ColMajor / RowMajor
         }
         if (!r.kind.isWritable() and r.kind != .consume_structured_buffer) try e.b.emit(.annotations, .member_decorate, &.{ st, 0, 24 }); // NonWritable
         try e.b.emit(.annotations, .decorate, &.{ st, e.bufferBlockDecoration() });
@@ -4071,7 +4144,43 @@ const Emitter = struct {
     }
 
     fn resourceInfo(e: *Emitter, r: Ref) @FieldType(types.Type, "resource") {
-        return e.t.get(e.f.inst(r).ty).resource;
+        return e.t.get(e.bindingType(r)).resource;
+    }
+
+    /// The type resource `r` (a value, or a pointer to one) is bound as,
+    /// following it to its binding as resourceBinding does: a global, an
+    /// element of a global array, a descriptor heap element (`decl`), or
+    /// what a specialization's parameter is bound to. Its buffer's
+    /// matrices are oriented as the buffer stores them; the value's own
+    /// type is canonical, and a local or parameter it passed through may
+    /// declare other orientations (a StructuredBuffer<row_major float4x4>
+    /// passed as a StructuredBuffer<float4x4>).
+    fn bindingType(e: *Emitter, r: Ref) TypeId {
+        const f = e.f;
+        var x = r;
+        var steps: usize = 0;
+        while (true) : (steps += 1) switch (f.inst(x).op) {
+            .load => |p| {
+                if (e.indexed_loads.get(x.index())) |il| return elemType(e.t, f.inst(il.global).ty, il.indices.len);
+                x = p;
+            },
+            .local_var => x = (if (steps < max_resource_steps) storedResource(f, x) else null) orelse return f.inst(x).ty,
+            else => break,
+        };
+        return switch (f.inst(x).op) {
+            .heap_resource => |h| h.decl,
+            .param => |pi| if (pi < e.cur_binding_types.len and e.cur_binding_types[pi] != 0) e.cur_binding_types[pi] else f.inst(x).ty,
+            // (A pointer to a global, or to an element of a global array:
+            // as declared.)
+            else => f.inst(x).ty,
+        };
+    }
+
+    /// The element of array type `ty` under `n` dimensions.
+    fn elemType(t: *const TypeTable, ty: TypeId, n: usize) TypeId {
+        var cur = ty;
+        for (0..n) |_| cur = t.get(cur).array.elem;
+        return cur;
     }
 
     /// The first components of a four-component texel, as `ty`.
@@ -4173,20 +4282,19 @@ const Emitter = struct {
         if (eq(u8, name, "DecrementCounter")) return e.counterOp(res, false, true);
         if (eq(u8, name, "Append") or eq(u8, name, "Consume")) {
             const idx = try e.counterOp(res, eq(u8, name, "Append"), eq(u8, name, "Consume"));
-            const elem = (try e.bufferElemType(e.f.inst(res).ty)).?;
+            const elem = (try e.bufferElemType(e.bindingType(res))).?;
             const ptr = try e.opRaw(.access_chain, try e.pointerType(e.bufferSc(), elem), &.{ e.val(res), try e.constUint(0), idx });
             const ety = r.elem;
             if (eq(u8, name, "Append")) {
-                try e.b.emit(.functions, .store, &.{ ptr, try e.toLayout(e.val(args[0]), e.f.inst(args[0]).ty, e.sbRules(), false) });
-                _ = ety;
+                try e.b.emit(.functions, .store, &.{ ptr, try e.toLayout(e.val(args[0]), ety, e.sbRules()) });
                 return 0;
             }
-            return e.fromLayout(try e.opRaw(.load, elem, &.{ptr}), ty, e.sbRules(), false);
+            return e.fromLayout(try e.opRaw(.load, elem, &.{ptr}), ety, e.sbRules());
         }
         if (eq(u8, name, "Load") and (r.kind == .structured_buffer or r.kind == .rw_structured_buffer)) {
             const ptr = try e.bufferElement(res, args[0]);
-            const raw = try e.opRaw(.load, try e.layoutTypeId(ty, e.sbRules(), false), &.{ptr});
-            return e.fromLayout(raw, ty, e.sbRules(), false);
+            const raw = try e.opRaw(.load, try e.layoutTypeId(r.elem, e.sbRules()), &.{ptr});
+            return e.fromLayout(raw, r.elem, e.sbRules());
         }
         const sh = texture.shape(r.kind) orelse return e.unsupported("method '{s}' is not supported yet", .{name});
         const call = texture.decode(name, sh, args.len) orelse return e.unsupported("method '{s}' is not supported yet", .{name});
@@ -4399,7 +4507,10 @@ const Emitter = struct {
     /// The scalar type and byte offset of flattened component `k` of a
     /// value of `ty` in a byte-address buffer (natural alignment).
     fn rawComponent(e: *Emitter, ty: TypeId, k: u32) Error!struct { TypeId, u32 } {
-        const off = layout.componentOffset(e.arena, e.t, ty, e.vk.legacy_matrix_order, k, .dx_packed) catch return e.unsupported("byte-address buffer accesses of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)});
+        // (Matrices are column_major there whatever the value's orientation,
+        // row_major with -fspv-use-legacy-buffer-matrix-order.)
+        const stored = try e.t.oriented(ty, if (e.vk.legacy_matrix_order) .row_major else .column_major, .replace);
+        const off = layout.componentOffset(e.arena, e.t, stored, k, .dx_packed) catch return e.unsupported("byte-address buffer accesses of type '{s}' are not supported yet", .{try e.t.format(e.arena, ty)});
         var cur = ty;
         var kk = k;
         while (true) switch (e.t.get(cur)) {
@@ -4535,7 +4646,7 @@ const Emitter = struct {
                 } else {
                     try store(e, args[0], len);
                     if (args.len > 1) {
-                        const stride = layout.arrayStride(e.t, r.elem, false, e.sbRules()) catch return e.unsupported("buffer element type", .{});
+                        const stride = layout.arrayStride(e.t, r.elem, e.sbRules()) catch return e.unsupported("buffer element type", .{});
                         try store(e, args[1], try e.constUint(stride));
                     }
                 }
@@ -4614,7 +4725,8 @@ const Emitter = struct {
     /// Interface values whose builtin type differs from the declared one
     /// (`uint i : SV_DispatchThreadID` reads component x of a uint3).
     fn reshape(e: *Emitter, v: Id, from: TypeId, to: TypeId) Error!Id {
-        if (from == to) return v;
+        // (SPIR-V types have no storage order: see typeId.)
+        if (e.t.same(from, to)) return v;
         const fs = e.t.shape(from).?;
         const ts = e.t.shape(to).?;
         var cur = v;
@@ -4634,7 +4746,7 @@ const Emitter = struct {
         } else if (ts.count() > fs.count()) {
             return e.unsupported("widening interface values is not supported yet", .{});
         }
-        if (cur_ty != to) cur = try e.convert(cur, cur_ty, try e.t.withComponent(cur_ty, e.t.component(to).?));
+        if (!e.t.same(cur_ty, to)) cur = try e.convert(cur, cur_ty, try e.t.withComponent(cur_ty, e.t.component(to).?));
         return cur;
     }
 

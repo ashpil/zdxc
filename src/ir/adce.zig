@@ -39,7 +39,7 @@ fn successors(a: Allocator, term: ir.Terminator) Allocator.Error![]const BlockId
 /// Operations whose results are their only effect.
 fn isPure(f: *const ir.Function, op: ir.Op) bool {
     return switch (op) {
-        .constant, .global, .load, .access, .binary, .unary, .cmp, .convert, .bitcast, .splat, .extract, .insert, .construct, .shuffle, .select, .heap_resource, .phi, .undef, .res_load, .local_var, .param, .input, .input_vertex, .patch_input => true,
+        .constant, .global, .load, .access, .address, .binary, .unary, .cmp, .convert, .bitcast, .splat, .extract, .insert, .construct, .shuffle, .select, .heap_resource, .phi, .undef, .res_load, .local_var, .param, .input, .input_vertex, .patch_input => true,
         .intrinsic => |x| opt.isPureIntrinsic(f, x.name, x.args),
         .method => |x| blk: {
             const reads = [_][]const u8{ "Load", "Sample", "SampleLevel", "SampleGrad", "SampleBias", "SampleCmp", "SampleCmpLevelZero", "SampleCmpLevel", "Gather", "GatherRed", "GatherGreen", "GatherBlue", "GatherAlpha", "GatherCmp", "GatherCmpRed", "CalculateLevelOfDetail", "CalculateLevelOfDetailUnclamped" };

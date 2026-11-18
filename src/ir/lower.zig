@@ -403,7 +403,11 @@ const Lowerer = struct {
         for (f.params, 0..) |p, k| {
             if (l.s.types.get(p.type) == .stream) continue;
             const sem = if (k < f.decl.params.len) semanticOf(f.decl.params[k].semantics) else null;
-            try params.append(l.arena, .{ .name = p.name, .ty = l.irType(p.type), .by_ref = p.dir != .in or p.groupshared, .groupshared = p.groupshared, .dir = switch (p.dir) {
+            const by_ref = p.dir != .in or p.groupshared;
+            // (A value parameter's type is canonical; one passed by
+            // reference points at storage as declared.)
+            const ty = l.irType(p.type);
+            try params.append(l.arena, .{ .name = p.name, .ty = if (by_ref) ty else l.s.types.canonical(ty), .by_ref = by_ref, .groupshared = p.groupshared, .dir = switch (p.dir) {
                 .in => .in,
                 .out => .out,
                 .inout => .inout,
@@ -413,7 +417,7 @@ const Lowerer = struct {
         const no_inline = !isMethod(f) and f.template_args.len == 0 and for (f.decl.attrs) |a| {
             if (std.mem.eql(u8, a.name, "noinline")) break true;
         } else false;
-        const i = try l.m.addFunction(.{ .name = f.name, .params = params.items, .ret = f.ret, .entry = l.cur_entry, .ret_semantic = semanticOf(f.decl.ret_semantics), .decl_order = order, .no_inline = no_inline });
+        const i = try l.m.addFunction(.{ .name = f.name, .params = params.items, .ret = l.s.types.canonical(f.ret), .entry = l.cur_entry, .ret_semantic = semanticOf(f.decl.ret_semantics), .decl_order = order, .no_inline = no_inline });
         try l.funcs.put(l.arena, f, i);
         try l.pending.append(l.arena, f);
         return i;
@@ -533,7 +537,7 @@ const Lowerer = struct {
         }
         const info = try l.arena.create(@import("../sema/types.zig").StructInfo);
         info.* = .{ .name = name, .complete = true };
-        for (members.items) |mv| try info.fields.append(l.arena, .{ .name = mv.name, .type = mv.type, .row_major = mv.row_major, .pack_offset = packOffset(mv), .vk_offset = if (mv.decl != null and l.s.opts.spirv) l.s.vkAttrInt(mv.decl.?.attrs, "vk::offset") else null });
+        for (members.items) |mv| try info.fields.append(l.arena, .{ .name = mv.name, .type = mv.type, .pack_offset = packOffset(mv), .vk_offset = if (mv.decl != null and l.s.opts.spirv) l.s.vkAttrInt(mv.decl.?.attrs, "vk::offset") else null });
         const ty = try l.s.types.intern(.{ .@"struct" = info });
         try l.m.globals.append(l.arena, .{ .name = name, .ty = ty, .space = .cbuffer, .binding = binding, .tbuffer = is_tbuffer, .shader_record = shader_record, .push_constant = push_constant });
         const gi: u32 = @intCast(l.m.globals.items.len - 1);
@@ -782,10 +786,14 @@ const Lowerer = struct {
     fn convert(l: *Lowerer, v: Ref, target: TypeId) Error!Ref {
         const t = l.types();
         const inst = l.b.f.inst(v);
-        if (inst.ty == target) return v;
-        // A descriptor heap element takes the type it is used as.
+        // (`target` may be a declaration's type, its matrices oriented: a
+        // value of it is of its canonical type.)
+        if (inst.ty == t.canonical(target)) return v;
+        // A descriptor heap element takes the type it is used as, bound
+        // as that is declared.
         if (t.get(inst.ty) == .dynamic_resource and inst.op == .heap_resource) {
-            return l.b.add(.{ .op = .{ .heap_resource = inst.op.heap_resource }, .ty = target });
+            const h = inst.op.heap_resource;
+            return l.b.add(.{ .op = .{ .heap_resource = .{ .index = h.index, .sampler = h.sampler, .decl = target } }, .ty = target });
         }
         // ConstantBuffer<S> read as an S: member by member.
         if (t.get(inst.ty) == .resource and t.get(target) == .@"struct") {
@@ -1073,7 +1081,7 @@ const Lowerer = struct {
                 const bt = t.get(x.base.ty);
                 if (bt == .descriptor_heap) {
                     const idx = try l.converted(x.index, try t.scalar(.uint));
-                    return l.b.add(.{ .op = .{ .heap_resource = .{ .index = idx, .sampler = bt.descriptor_heap.sampler } }, .ty = e.ty });
+                    return l.b.add(.{ .op = .{ .heap_resource = .{ .index = idx, .sampler = bt.descriptor_heap.sampler, .decl = e.ty } }, .ty = e.ty });
                 }
                 if (bt == .resource) {
                     const res = try l.rvalue(x.base);
@@ -1225,7 +1233,7 @@ const Lowerer = struct {
     fn convertExplicit(l: *Lowerer, v: Ref, target: TypeId) Error!Ref {
         const t = l.types();
         const from = l.b.f.inst(v).ty;
-        if (from == target) return v;
+        if (from == t.canonical(target)) return v;
         if (t.get(from) == .dynamic_resource) return l.convert(v, target);
         const aggregate = switch (t.get(target)) {
             .@"struct", .array => true,
@@ -1660,6 +1668,23 @@ const Lowerer = struct {
         }
     }
 
+    /// vk::RawBufferLoad<T>(addr[, alignment]) / RawBufferStore<T>(addr,
+    /// value[, alignment]): a load or store through a pointer to T at the
+    /// address.
+    fn rawBufferAccess(l: *Lowerer, acc: Sema.RawBufferAccess, it: anytype, args: []const *ast.Expr) Error!Ref {
+        // (Recorded by Sema once checked; it reported any error.)
+        const rb = it.raw_buffer orelse return error.Unsupported;
+        const addr = try l.converted(args[0], try l.concrete(it.params[0]));
+        const ptr = try l.b.add(.{ .op = .{ .address = .{ .addr = addr, .alignment = rb.alignment } }, .ty = rb.ty, .ptr = .physical });
+        switch (acc) {
+            .load => return l.b.load(ptr),
+            .store => {
+                try l.b.store(ptr, try l.converted(args[1], rb.ty));
+                return .none;
+            },
+        }
+    }
+
     fn callOther(l: *Lowerer, e: *ast.Expr, r: semamod.Resolution, callee: *ast.Expr, args: []const *ast.Expr, ret_ty: TypeId) Error!Ref {
         switch (r) {
             .intrinsic => |it| {
@@ -1699,6 +1724,9 @@ const Lowerer = struct {
                     p.* = .{ .opcode = 1, .set = "NonSemantic.DebugPrintf", .operands = ops, .extensions = try l.arena.dupe([]const u8, &.{"SPV_KHR_non_semantic_info"}) };
                     return l.b.add(.{ .op = .{ .spirv_inst = p }, .ty = TypeTable.void_type });
                 }
+                if (std.mem.eql(u8, spec.namespace, "VkIntrinsics")) if (Sema.RawBufferAccess.of(name)) |acc| {
+                    return l.rawBufferAccess(acc, it, args);
+                };
                 if (std.mem.eql(u8, name, "DispatchMesh") and args.len == 4) {
                     // The payload goes by reference (a groupshared
                     // variable).
@@ -2200,7 +2228,6 @@ const Lowerer = struct {
     /// Per-element modifiers that reach the signature.
     const SigAttrs = struct {
         interp: Interp = .{},
-        row_major: bool = false,
         precise: bool = false,
         vk_location: ?u32 = null,
         vk_index: ?u32 = null,
@@ -2210,14 +2237,13 @@ const Lowerer = struct {
         /// A field's modifiers, inheriting the enclosing interpolation.
         fn field(outer: SigAttrs, fld: Field) SigAttrs {
             const own: u8 = @bitCast(fld.interp);
-            return .{ .interp = if (own != 0) fld.interp else outer.interp, .row_major = fld.row_major, .precise = fld.precise, .vk_location = fld.vk_location, .vk_index = fld.vk_index, .vk_builtin = fld.vk_builtin };
+            return .{ .interp = if (own != 0) fld.interp else outer.interp, .precise = fld.precise, .vk_location = fld.vk_location, .vk_index = fld.vk_index, .vk_builtin = fld.vk_builtin };
         }
     };
 
     fn withAttrs(el: ir.SigElement, attrs: SigAttrs) ir.SigElement {
         var r = el;
         r.interp = attrs.interp;
-        r.row_major = attrs.row_major;
         r.precise = attrs.precise;
         r.vk_location = attrs.vk_location;
         r.vk_index = attrs.vk_index;
@@ -2226,16 +2252,15 @@ const Lowerer = struct {
         return r;
     }
 
-    /// A parameter's (or the return value's) interpolation and matrix
-    /// orientation.
-    fn paramAttrs(l: *Lowerer, q: ast.Qualifiers, ty: *const ast.TypeRef) SigAttrs {
-        return .{ .interp = semamod.interpOf(q), .row_major = l.s.sig_row_major.get(ty) orelse q.row_major, .precise = q.precise };
+    /// A parameter's (or the return value's) interpolation and precision.
+    fn paramAttrs(q: ast.Qualifiers) SigAttrs {
+        return .{ .interp = semamod.interpOf(q), .precise = q.precise };
     }
 
     /// A parameter's (or, with the function's attributes, the return
     /// value's) signature modifiers.
-    fn sigAttrs(l: *Lowerer, q: ast.Qualifiers, attrs: []const ast.Attribute, ty: *const ast.TypeRef) SigAttrs {
-        var a = l.paramAttrs(q, ty);
+    fn sigAttrs(l: *Lowerer, q: ast.Qualifiers, attrs: []const ast.Attribute) SigAttrs {
+        var a = paramAttrs(q);
         a.vk_location = l.s.vkAttrInt(attrs, "vk::location");
         a.vk_index = l.s.vkAttrInt(attrs, "vk::index");
         for (attrs) |at| if (std.mem.eql(u8, at.name, "vk::builtin") and at.args.len == 1 and at.args[0].kind == .string_lit) {
@@ -2344,7 +2369,7 @@ const Lowerer = struct {
                 const init_e = v.init orelse continue;
                 if (!l.globals.contains(v) or inits.contains(v)) continue;
                 if (isObject(&l.s.types, v.type)) continue;
-                const fi = try l.m.addFunction(.{ .name = try std.fmt.allocPrint(l.arena, "init.{s}", .{v.name}), .params = &.{}, .ret = v.type, .entry = l.cur_entry });
+                const fi = try l.m.addFunction(.{ .name = try std.fmt.allocPrint(l.arena, "init.{s}", .{v.name}), .params = &.{}, .ret = l.s.types.canonical(v.type), .entry = l.cur_entry });
                 try inits.put(l.arena, v, fi);
                 l.b = .{ .m = &l.m, .f = l.m.functions.items[fi] };
                 l.vars = .empty;
@@ -2405,7 +2430,7 @@ const Lowerer = struct {
     fn registerStreams(l: *Lowerer, f: *const semamod.Function) Error!void {
         l.entry_fn = f;
         for (f.params, 0..) |p, i| {
-            const st = switch (l.s.types.get(p.type)) {
+            const st = switch (l.s.types.get(p.sig_type)) {
                 .stream => |st| st,
                 else => continue,
             };
@@ -2534,7 +2559,7 @@ const Lowerer = struct {
         const points = try l.arena.alloc(Ref, patch.count);
         for (points, 0..) |*v, k| {
             var next = first;
-            v.* = try l.vertexIn(entry, patch.elem, semanticOf(pd.semantics), l.sigAttrs(pd.quals, pd.attrs, pd.type), @intCast(k), register and k == 0, &next, null, pd.name_loc);
+            v.* = try l.vertexIn(entry, patch.elem, semanticOf(pd.semantics), l.sigAttrs(pd.quals, pd.attrs), @intCast(k), register and k == 0, &next, null, pd.name_loc);
         }
         try l.b.store(local, try l.b.add(.{ .op = .{ .construct = points }, .ty = l.irType(pty) }));
     }
@@ -2598,24 +2623,24 @@ const Lowerer = struct {
                     // The entry's output control points, read back.
                     l.vertex_from_outputs = true;
                     defer l.vertex_from_outputs = false;
-                    try l.storeControlPoints(entry, locals[i], p.type, pd, 0, false);
+                    try l.storeControlPoints(entry, locals[i], p.sig_type, pd, 0, false);
                 } else {
                     const first = cp_first orelse @as(u32, @intCast(entry.inputs.items.len));
-                    try l.storeControlPoints(entry, locals[i], p.type, pd, first, cp_first == null);
+                    try l.storeControlPoints(entry, locals[i], p.sig_type, pd, first, cp_first == null);
                 }
                 args[i] = try l.b.load(locals[i]);
                 continue;
             }
-            if (p.dir != .out) try l.b.store(locals[i], try l.entryInput(entry, p.type, semanticOf(pd.semantics), l.sigAttrs(pd.quals, pd.attrs, pd.type), pd.name_loc, pd.name));
+            if (p.dir != .out) try l.b.store(locals[i], try l.entryInput(entry, p.sig_type, semanticOf(pd.semantics), l.sigAttrs(pd.quals, pd.attrs), pd.name_loc, pd.name));
             args[i] = if (p.dir == .in) try l.b.load(locals[i]) else locals[i];
         }
         const ret = try l.b.add(.{ .op = .{ .call = .{ .func = pci, .args = args } }, .ty = pcf.ret });
         l.patch_io = true;
         defer l.patch_io = false;
-        if (pcf.ret != TypeTable.void_type) try l.entryOutput(entry, pcf.ret, semanticOf(pcf.decl.ret_semantics), l.paramAttrs(pcf.decl.quals, pcf.decl.ret), ret, pcf.loc, "return value");
+        if (pcf.ret != TypeTable.void_type) try l.entryOutput(entry, pcf.sig_ret, semanticOf(pcf.decl.ret_semantics), paramAttrs(pcf.decl.quals), ret, pcf.loc, "return value");
         for (pcf.decl.params, pcf.params, 0..) |pd, p, i| {
             if (p.dir == .in) continue;
-            try l.entryOutput(entry, p.type, semanticOf(pd.semantics), l.sigAttrs(pd.quals, pd.attrs, pd.type), try l.b.load(locals[i]), pd.name_loc, pd.name);
+            try l.entryOutput(entry, p.sig_type, semanticOf(pd.semantics), l.sigAttrs(pd.quals, pd.attrs), try l.b.load(locals[i]), pd.name_loc, pd.name);
         }
         l.b.terminate(.{ .ret = .none });
         entry.patch_wrapper = wrapper;
@@ -2774,18 +2799,18 @@ const Lowerer = struct {
             }
             if (opts.stage == .mesh and (q.vertices or q.indices or q.primitives) and l.s.types.get(p.type) == .array) {
                 // Output arrays: stores through them write the outputs.
-                const arr = l.s.types.get(p.type).array;
+                const arr = l.s.types.get(p.sig_type).array;
                 const kind: ir.MeshOutput = if (q.vertices) .vertices else if (q.primitives) .primitives else .indices;
                 switch (kind) {
                     .vertices => {
                         entry.mesh.max_vertices = arr.len;
                         var next: u32 = @intCast(entry.outputs.items.len);
-                        try l.streamOut(&entry.outputs, arr.elem, semanticOf(pd.semantics), l.sigAttrs(q, pd.attrs, pd.type), null, &next, 0, null, pd.name_loc);
+                        try l.streamOut(&entry.outputs, arr.elem, semanticOf(pd.semantics), l.sigAttrs(q, pd.attrs), null, &next, 0, null, pd.name_loc);
                     },
                     .primitives => {
                         entry.mesh.max_primitives = arr.len;
                         var next: u32 = @intCast(entry.patch_constants.items.len);
-                        try l.streamOut(&entry.patch_constants, arr.elem, semanticOf(pd.semantics), l.sigAttrs(q, pd.attrs, pd.type), null, &next, 0, null, pd.name_loc);
+                        try l.streamOut(&entry.patch_constants, arr.elem, semanticOf(pd.semantics), l.sigAttrs(q, pd.attrs), null, &next, 0, null, pd.name_loc);
                     },
                     .indices => {
                         entry.mesh.max_primitives = arr.len;
@@ -2807,7 +2832,7 @@ const Lowerer = struct {
                 // Control points: one value per point of the patch.
                 const first: u32 = @intCast(entry.inputs.items.len);
                 cp_first = first;
-                try l.storeControlPoints(&entry, locals[i], p.type, pd, first, true);
+                try l.storeControlPoints(&entry, locals[i], p.sig_type, pd, first, true);
                 args[i] = try l.b.load(locals[i]);
                 continue;
             }
@@ -2815,20 +2840,20 @@ const Lowerer = struct {
                 // Everything else a domain shader reads is per patch.
                 l.patch_io = true;
                 defer l.patch_io = false;
-                try l.b.store(locals[i], try l.entryInput(&entry, p.type, semanticOf(pd.semantics), l.sigAttrs(pd.quals, pd.attrs, pd.type), pd.name_loc, pd.name));
+                try l.b.store(locals[i], try l.entryInput(&entry, p.sig_type, semanticOf(pd.semantics), l.sigAttrs(pd.quals, pd.attrs), pd.name_loc, pd.name));
                 args[i] = if (p.dir == .in) try l.b.load(locals[i]) else locals[i];
                 continue;
             }
             if (opts.stage == .geometry and (q.point or q.line or q.triangle or q.lineadj or q.triangleadj) and l.s.types.get(p.type) == .array) {
                 // Per-vertex inputs: one value per vertex of the primitive.
-                const arr = l.s.types.get(p.type).array;
+                const arr = l.s.types.get(p.sig_type).array;
                 entry.geometry.input = if (q.point) .point else if (q.line) .line else if (q.triangle) .triangle else if (q.lineadj) .line_adj else .triangle_adj;
                 entry.geometry.input_vertices = arr.len;
                 const first: u32 = @intCast(entry.inputs.items.len);
                 const verts = try l.arena.alloc(Ref, arr.len);
                 for (verts, 0..) |*v, vx| {
                     var next = first;
-                    v.* = try l.vertexIn(&entry, arr.elem, semanticOf(pd.semantics), l.sigAttrs(pd.quals, pd.attrs, pd.type), @intCast(vx), vx == 0, &next, null, pd.name_loc);
+                    v.* = try l.vertexIn(&entry, arr.elem, semanticOf(pd.semantics), l.sigAttrs(pd.quals, pd.attrs), @intCast(vx), vx == 0, &next, null, pd.name_loc);
                 }
                 try l.b.store(locals[i], try l.b.add(.{ .op = .{ .construct = verts }, .ty = p.type }));
                 args[i] = try l.b.load(locals[i]);
@@ -2844,7 +2869,7 @@ const Lowerer = struct {
                 continue;
             }
             if (p.dir != .out) {
-                const v = try l.entryInput(&entry, p.type, semanticOf(pd.semantics), l.sigAttrs(pd.quals, pd.attrs, pd.type), pd.name_loc, pd.name);
+                const v = try l.entryInput(&entry, p.sig_type, semanticOf(pd.semantics), l.sigAttrs(pd.quals, pd.attrs), pd.name_loc, pd.name);
                 try l.b.store(locals[i], v);
             }
             args[i] = if (p.dir == .in) try l.b.load(locals[i]) else locals[i];
@@ -2853,7 +2878,7 @@ const Lowerer = struct {
         for (f.params, 0..) |p, i| if (l.s.types.get(p.type) != .stream) try call_args.append(l.arena, args[i]);
         std.debug.assert(call_args.items.len == n_args);
         const ret = try l.b.add(.{ .op = .{ .call = .{ .func = main, .args = call_args.items } }, .ty = f.ret });
-        if (f.ret != TypeTable.void_type) try l.entryOutput(&entry, f.ret, semanticOf(f.decl.ret_semantics), l.sigAttrs(f.decl.quals, f.decl.attrs, f.decl.ret), ret, f.loc, "return value");
+        if (f.ret != TypeTable.void_type) try l.entryOutput(&entry, f.sig_ret, semanticOf(f.decl.ret_semantics), l.sigAttrs(f.decl.quals, f.decl.attrs), ret, f.loc, "return value");
         for (f.decl.params, f.params, 0..) |pd, p, i| {
             if (p.dir == .in or l.s.types.get(p.type) == .stream) continue;
             if (l.b.f.inst(locals[i]).ptr == .mesh) continue;
@@ -2862,7 +2887,7 @@ const Lowerer = struct {
                 try l.b.store(ray_srcs[i], v);
                 continue;
             }
-            try l.entryOutput(&entry, p.type, semanticOf(pd.semantics), l.sigAttrs(pd.quals, pd.attrs, pd.type), v, pd.name_loc, pd.name);
+            try l.entryOutput(&entry, p.sig_type, semanticOf(pd.semantics), l.sigAttrs(pd.quals, pd.attrs), v, pd.name_loc, pd.name);
         }
         l.b.terminate(.{ .ret = .none });
         entry.wrapper = wrapper;
