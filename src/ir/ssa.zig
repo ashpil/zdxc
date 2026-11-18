@@ -80,6 +80,7 @@ pub fn run(m: *ir.Module) Error!void {
             try removeTrivialPhis(m.arena, f);
             if (!folded or pass == 2) break;
         }
+        try f.settleDebugValues(m.arena);
     }
 }
 
@@ -1532,6 +1533,7 @@ fn promote(m: *ir.Module, f: *ir.Function) Error!void {
         // Values recorded in this block that have no place yet: before
         // the next instruction kept.
         var unplaced = f.dbg_values.items.len;
+        const first_value = unplaced;
         for (phis[bi].items) |p| if (!repl.contains(p.r.index())) {
             try out.append(a, p.r);
             if (owners.get(pvars.items[p.v].index())) |os| for (os.items) |o| {
@@ -1551,10 +1553,15 @@ fn promote(m: *ir.Module, f: *ir.Function) Error!void {
                 },
                 else => {},
             }
-            for (f.dbg_values.items[unplaced..]) |*dv| dv.before = r;
+            for (f.dbg_values.items[unplaced..]) |*dv| {
+                dv.before = r;
+                dv.pos = @intCast(out.items.len);
+            }
             unplaced = f.dbg_values.items.len;
             try out.append(a, r);
         }
+        for (f.dbg_values.items[unplaced..]) |*dv| dv.pos = @intCast(out.items.len);
+        for (f.dbg_values.items[first_value..]) |*dv| dv.ctx = out.items;
         for (out.items) |r| {
             var hit = false;
             try forOperands(a, f.inst(r).op, Hit{ .repl = &repl, .hit = &hit });
@@ -1625,6 +1632,7 @@ fn removeTrivialPhis(a: Allocator, f: *ir.Function) Error!void {
         };
     }
     if (!any) return;
+    f.mapDebugValues(mp);
     for (f.blocks.items) |*blk| {
         var out: std.ArrayList(Ref) = .empty;
         for (blk.insts.items) |r| {

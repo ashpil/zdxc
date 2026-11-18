@@ -123,6 +123,11 @@ pub const DebugValue = struct {
     value: Ref,
     /// Where it was assigned.
     loc: source.Loc = .none,
+    /// The block's instructions when the value was recorded, and where in
+    /// them it was (before `ctx[pos]`): what `Function.settleDebugValues`
+    /// finds its place from after later passes.
+    ctx: []const Ref = &.{},
+    pos: u32 = 0,
 };
 
 /// A local that holds one member of a variable since scalar replacement
@@ -347,6 +352,72 @@ pub const Function = struct {
 
     pub fn inst(f: *const Function, r: Ref) Inst {
         return f.insts.items[r.index()];
+    }
+
+    /// After a pass replaced values: the variables that held them hold
+    /// what `mp.map` gives.
+    pub fn mapDebugValues(f: *Function, mp: anytype) void {
+        for (f.dbg_values.items) |*dv| dv.value = mp.map(dv.value);
+    }
+
+    /// After the passes that follow promotion (which remove, merge and
+    /// replace instructions without regard for `dbg_values`): each value
+    /// is where the nearest instruction left of those it was among is,
+    /// and the values that are gone (dead code keeps nothing for debug
+    /// information; a constant or a parameter needs no instruction) are
+    /// dropped.
+    pub fn settleDebugValues(f: *Function, a: Allocator) Allocator.Error!void {
+        if (f.dbg_values.items.len == 0) return;
+        const none = std.math.maxInt(u32);
+        const Place = struct { block: u32, at: u32 };
+        const place = try a.alloc(Place, f.insts.items.len);
+        @memset(place, .{ .block = none, .at = 0 });
+        for (f.blocks.items, 0..) |blk, bi| for (blk.insts.items, 0..) |r, k| {
+            place[r.index()] = .{ .block = @intCast(bi), .at = @intCast(k) };
+        };
+        var n: usize = 0;
+        for (f.dbg_values.items) |dv| {
+            // (What the emitters make before any block.)
+            const constant = switch (f.inst(dv.value).op) {
+                .constant, .param, .undef => true,
+                else => false,
+            };
+            const def = place[dv.value.index()];
+            if (!constant and def.block == none) continue;
+            var blk: u32 = none;
+            var at: u32 = 0;
+            const pos = @min(dv.pos, dv.ctx.len);
+            for (dv.ctx[pos..]) |r| {
+                const p = place[r.index()];
+                if (p.block == none) continue;
+                blk = p.block;
+                at = p.at;
+                break;
+            }
+            var k = pos;
+            while (blk == none and k > 0) {
+                k -= 1;
+                const p = place[dv.ctx[k].index()];
+                if (p.block == none) continue;
+                blk = p.block;
+                at = p.at + 1;
+            }
+            if (blk == none) {
+                // Nothing left of its block: where the value is made.
+                if (def.block == none) continue;
+                blk = def.block;
+                at = def.at + 1;
+            }
+            if (def.block == blk and at <= def.at) at = def.at + 1;
+            const insts = f.blocks.items[blk].insts.items;
+            while (at < insts.len and f.inst(insts[at]).op == .phi) at += 1;
+            var x = dv;
+            x.block = @fromBackingInt(blk);
+            x.before = if (at < insts.len) insts[at] else .none;
+            f.dbg_values.items[n] = x;
+            n += 1;
+        }
+        f.dbg_values.shrinkRetainingCapacity(n);
     }
 
     pub fn locOf(f: *const Function, r: Ref) DebugLoc {

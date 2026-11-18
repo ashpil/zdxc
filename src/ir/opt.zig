@@ -1127,6 +1127,7 @@ pub fn forwardExtracts(a: Allocator, f: *ir.Function, t: *TypeTable) Allocator.E
         }
     };
     if (!any) return;
+    f.mapDebugValues(mp);
     for (f.blocks.items) |*b| {
         for (b.insts.items) |r| f.insts.items[r.index()].op = try mapOp(a, f.inst(r).op, mp);
         b.term = switch (b.term) {
