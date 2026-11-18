@@ -11,7 +11,7 @@ const Allocator = std.mem.Allocator;
 const ast = @import("../front/ast.zig");
 const ast_clone = @import("../front/ast_clone.zig");
 const source = @import("../front/source.zig");
-const lexer = @import("../front/lexer.zig");
+const literal = @import("../front/literal.zig");
 const diag = @import("../diag.zig");
 const types = @import("types.zig");
 const layout = @import("../ir/layout.zig");
@@ -1637,12 +1637,77 @@ pub const Sema = struct {
         };
     }
 
-    /// A constant variable's initializer, in its declaring scope.
+    /// A constant variable's initializer, in its declaring scope, as a
+    /// value of the variable's type.
     fn evalVarConst(s: *Sema, v: *const Variable) ?Const {
         const saved = s.scope;
         defer s.scope = saved;
         if (v.init_scope) |sc| s.scope = sc;
-        return s.evalConst(v.init orelse return null);
+        const c = s.evalConst(v.init orelse return null) orelse return null;
+        return s.convertConst(v.type, c);
+    }
+
+    /// `c` converted to scalar (or enum) type `ty`, as an implicit
+    /// conversion or a cast does: an integer wraps to the type's width, a
+    /// float truncates to an integer. Other types leave it as it is.
+    fn convertConst(s: *Sema, ty: TypeId, c: Const) Const {
+        if (ty == TypeTable.error_type) return c;
+        const sc: Scalar = switch (s.types.get(ty)) {
+            .scalar => |x| x,
+            .@"enum" => |en| en.underlying,
+            else => return c,
+        };
+        if (sc == .bool) return .{ .bool = truthy(c) };
+        if (sc.isFloat()) return switch (c) {
+            .int => |v| .{ .float = @floatFromInt(v) },
+            .bool => |b| .{ .float = @floatFromInt(@intFromBool(b)) },
+            .float => c,
+        };
+        if (!sc.isInt()) return c;
+        return .{ .int = wrapInt(sc, switch (c) {
+            .int => |v| v,
+            .bool => |b| @intFromBool(b),
+            .float => |f| if (std.math.isFinite(f) and @abs(f) < 0x1p63) @as(i64, @intFromFloat(@trunc(f))) else return c,
+        }) };
+    }
+
+    /// The integer type of a constant expression, if it has one that is
+    /// known: the type Sema gave it, or for what Sema has not checked (a
+    /// template argument) the type its literals give it. A bool counts as
+    /// an int, as it is promoted to one.
+    fn constIntType(s: *Sema, e: *const ast.Expr) ?Scalar {
+        if (e.ty != TypeTable.error_type) {
+            const sc: Scalar = switch (s.types.get(e.ty)) {
+                .scalar => |x| x,
+                .@"enum" => |en| en.underlying,
+                else => return null,
+            };
+            return if (sc == .bool) .int else if (sc.isInt()) sc else null;
+        }
+        return switch (e.kind) {
+            .int_lit => |t| intLiteralType(t),
+            .bool_lit => .int,
+            .unary => |u| if (u.op == .not) .int else s.constIntType(u.operand),
+            .binary => |b| switch (b.op) {
+                .add, .sub, .mul, .div, .rem, .bit_and, .bit_or, .bit_xor => commonInt(s.constIntType(b.lhs), s.constIntType(b.rhs)),
+                .shl, .shr => s.constIntType(b.lhs),
+                .lt, .gt, .le, .ge, .eq, .ne, .log_and, .log_or => .int,
+                else => null,
+            },
+            else => null,
+        };
+    }
+
+    /// A binary operation on constants: integer operands are converted to
+    /// their common type first, and the result has that type's width, so
+    /// `0xFFFFFFFFu + 1` is 0 and `-1 < 0u` is false, as when lowered.
+    fn foldBinary(s: *Sema, op: ast.BinaryOp, lhs: *const ast.Expr, rhs: *const ast.Expr, l: Const, r: Const) ?Const {
+        if (l == .float or r == .float) return evalBinary(op, l, r, null);
+        const lt = s.constIntType(lhs);
+        return evalBinary(op, l, r, switch (op) {
+            .shl, .shr => lt,
+            else => commonInt(lt, s.constIntType(rhs)),
+        });
     }
 
     pub fn evalVarInt(s: *Sema, v: *const Variable) ?i64 {
@@ -1712,16 +1777,18 @@ pub const Sema = struct {
             },
             .unary => |u| blk: {
                 const v = s.evalConst(u.operand) orelse break :blk null;
+                // (The result wraps to the operand's width: `~0u` is 0xFFFFFFFF.)
+                const ty = s.constIntType(e) orelse .literal_int;
                 break :blk switch (u.op) {
                     .plus => v,
                     .minus => switch (v) {
-                        .int => |x| .{ .int = -%x },
+                        .int => |x| .{ .int = wrapInt(ty, -%x) },
                         .float => |x| .{ .float = -x },
-                        .bool => |b| .{ .int = -@as(i64, @intFromBool(b)) },
+                        .bool => |b| .{ .int = wrapInt(ty, -@as(i64, @intFromBool(b))) },
                     },
                     .not => .{ .bool = !truthy(v) },
                     .bit_not => switch (v) {
-                        .int => |x| .{ .int = ~x },
+                        .int => |x| .{ .int = wrapInt(ty, ~x) },
                         else => null,
                     },
                     else => null,
@@ -1730,14 +1797,14 @@ pub const Sema = struct {
             .binary => |b| blk: {
                 const l = s.evalConst(b.lhs) orelse break :blk null;
                 const r = s.evalConst(b.rhs) orelse break :blk null;
-                break :blk evalBinary(b.op, l, r);
+                break :blk s.foldBinary(b.op, b.lhs, b.rhs, l, r);
             },
             .conditional => |c| blk: {
                 const cond = s.evalConst(c.cond) orelse break :blk null;
                 break :blk if (truthy(cond)) s.evalConst(c.then) else s.evalConst(c.@"else");
             },
-            .cast => |c| s.evalConst(c.operand),
-            .construct => |c| if (c.args.len == 1) s.evalConst(c.args[0]) else null,
+            .cast => |c| if (s.evalConst(c.operand)) |v| s.convertConst(e.ty, v) else null,
+            .construct => |c| if (c.args.len != 1) null else if (s.evalConst(c.args[0])) |v| s.convertConst(e.ty, v) else null,
             // Sizes are kept by Sema (plus one; zero: unknown).
             // (Fresh for types: template arguments are shared by instances.)
             .sizeof_type => |t| blk: {
@@ -2920,8 +2987,15 @@ pub const Sema = struct {
     /// returns false if there was one.
     fn checkLiteralSuffix(s: *Sema, loc: Loc, text: []const u8) bool {
         if (text[0] == '\'') {
-            if (lexer.charValue(text) != null) return true;
-            s.err(loc, "empty character constant", .{});
+            const c = literal.parseChar(text);
+            if (!literal.reportChar(s.diags, loc, c)) return false;
+            if (c.count == 1) return true;
+            // `''` is no token at all, and HLSL has no multi-character constants.
+            if (c.count == 0) {
+                s.err(loc, "expected expression", .{});
+            } else {
+                s.err(loc, "unsupported style of char literal - use a single-character char-based literal", .{});
+            }
             return false;
         }
         const lit = scanLiteral(text);
@@ -2944,69 +3018,13 @@ pub const Sema = struct {
         return false;
     }
 
-    /// Literals whose digits do not form a number (clang's
-    /// NumericLiteralParser errors). After this, parseIntLiteral and
-    /// parseFloatLiteral succeed on whatever checkLiteralSuffix accepts:
-    /// both take their digits from scanLiteral, as this does.
+    /// Literals whose digits do not form a number. After this,
+    /// parseIntLiteral and parseFloatLiteral succeed on whatever
+    /// checkLiteralSuffix accepts: all take their digits from scanLiteral.
     fn checkLiteralDigits(s: *Sema, loc: Loc, text: []const u8, lit: Literal) bool {
-        const hex = isHexLiteral(text);
-        const binary = isBinaryLiteral(text);
-        if (hex) {
-            // `0x`, `0xp1`: no significand and no `.`, so the suffix starts at `x`.
-            var i: usize = 2;
-            while (i < text.len and std.ascii.isHex(text[i])) i += 1;
-            if (i == 2) {
-                if (i == text.len or text[i] != '.') {
-                    s.err(loc.advance(1), "invalid suffix '{s}' on integer constant", .{text[1..]});
-                    return false;
-                }
-                // `0x.`, `0x.p1`: a `.` with no digits on either side.
-                i += 1;
-                const frac = i;
-                while (i < text.len and std.ascii.isHex(text[i])) i += 1;
-                if (i == frac) {
-                    s.err(loc.advance(@intCast(i)), "hexadecimal floating constants require a significand", .{});
-                    return false;
-                }
-            }
-        }
-        if (lit.end < text.len) {
-            const c = text[lit.end];
-            if (binary) {
-                // clang: any hex digit after the binary digits (`0b12`, `0b1f`).
-                if (std.ascii.isHex(c)) {
-                    s.err(loc.advance(@intCast(lit.end)), "invalid digit '{c}' in binary constant", .{c});
-                    return false;
-                }
-            } else if (std.mem.indexOfScalar(u8, if (hex) "pP" else "eE", c) != null) {
-                s.err(loc.advance(@intCast(lit.end)), "exponent has no digits", .{});
-                return false;
-            }
-        }
-        if (lit.inf) return true;
-        const digits = text[0..lit.end];
-        if (hex and lit.float and std.mem.indexOfAny(u8, digits, "pP") == null) {
-            s.err(loc.advance(@intCast(lit.end)), "hexadecimal floating constants require an exponent", .{});
-            return false;
-        }
-        if (lit.float) return true;
-        if (!hex and !binary) {
-            if (digits.len > 1 and digits[0] == '0') for (digits[1..], 1..) |c, i| if (c >= '8') {
-                s.err(loc.advance(@intCast(i)), "invalid digit '{c}' in octal constant", .{c});
-                return false;
-            };
-            // clang: a hex letter after decimal / octal digits (`1f`, `0f`, `07a`).
-            if (lit.end < text.len and std.ascii.isHex(text[lit.end])) {
-                const c = text[lit.end];
-                s.err(loc.advance(@intCast(lit.end)), "invalid digit '{c}' in {s} constant", .{ c, if (digits[0] == '0') "octal" else "decimal" });
-                return false;
-            }
-        }
-        if (parseIntLiteral(digits) == null) {
-            s.err(loc, "integer literal is too large to be represented in any integer type", .{});
-            return false;
-        }
-        return true;
+        const p = literal.checkDigits(text, lit) orelse return true;
+        literal.report(s.diags, loc, p);
+        return false;
     }
 
     fn rvalue(ty: TypeId) Typed {
@@ -4326,7 +4344,41 @@ fn truthy(v: Sema.Const) bool {
     };
 }
 
-fn evalBinary(op: ast.BinaryOp, l: Sema.Const, r: Sema.Const) ?Sema.Const {
+/// `v` as a value of integer type `sc`: wrapped to its width, sign- or
+/// zero-extended. (Minimum-precision integers are computed in 32 bits.)
+fn wrapInt(sc: Scalar, v: i64) i64 {
+    const u: u64 = @bitCast(v);
+    return switch (sc) {
+        .int, .min16int, .min12int => @as(i32, @bitCast(@as(u32, @truncate(u)))),
+        .uint, .min16uint, .int8_4packed, .uint8_4packed => @as(u32, @truncate(u)),
+        .int16 => @as(i16, @bitCast(@as(u16, @truncate(u)))),
+        .uint16 => @as(u16, @truncate(u)),
+        else => v,
+    };
+}
+
+fn intBits(sc: Scalar) u8 {
+    return switch (sc) {
+        .int64, .uint64, .literal_int => 64,
+        .int16, .uint16 => 16,
+        else => 32,
+    };
+}
+
+/// The type two integer operands are converted to: a literal takes the
+/// other's type, the wider type wins, and of two as wide the unsigned one.
+fn commonInt(a: ?Scalar, b: ?Scalar) ?Scalar {
+    const x = a orelse return null;
+    const y = b orelse return null;
+    if (x == .literal_int) return y;
+    if (y == .literal_int) return x;
+    if (intBits(x) != intBits(y)) return if (intBits(x) > intBits(y)) x else y;
+    return if (y.isUnsigned()) y else x;
+}
+
+/// `ty`: the integer type the operands are converted to and the result
+/// has (for a shift, the left operand's); null computes in 64 bits.
+fn evalBinary(op: ast.BinaryOp, l: Sema.Const, r: Sema.Const, ty: ?Scalar) ?Sema.Const {
     if (op == .log_and) return .{ .bool = truthy(l) and truthy(r) };
     if (op == .log_or) return .{ .bool = truthy(l) or truthy(r) };
     const is_float = l == .float or r == .float;
@@ -4355,56 +4407,63 @@ fn evalBinary(op: ast.BinaryOp, l: Sema.Const, r: Sema.Const) ?Sema.Const {
             else => null,
         };
     }
-    const a: i64 = switch (l) {
+    const sc = ty orelse .literal_int;
+    const shift = op == .shl or op == .shr;
+    const a: i64 = wrapInt(sc, switch (l) {
         .int => |x| x,
         .bool => |b| @intFromBool(b),
         .float => unreachable,
-    };
-    const b: i64 = switch (r) {
+    });
+    const rv: i64 = switch (r) {
         .int => |x| x,
         .bool => |x| @intFromBool(x),
         .float => unreachable,
     };
-    return switch (op) {
-        .add => .{ .int = a +% b },
-        .sub => .{ .int = a -% b },
-        .mul => .{ .int = a *% b },
-        .div => if (b == 0) null else .{ .int = @divTrunc(a, b) },
-        .rem => if (b == 0) null else .{ .int = @rem(a, b) },
-        .shl => .{ .int = if (b < 0 or b >= 64) 0 else a << @intCast(b) },
-        .shr => .{ .int = if (b < 0 or b >= 64) 0 else a >> @intCast(b) },
-        .bit_and => .{ .int = a & b },
-        .bit_or => .{ .int = a | b },
-        .bit_xor => .{ .int = a ^ b },
-        .lt => .{ .bool = a < b },
-        .gt => .{ .bool = a > b },
-        .le => .{ .bool = a <= b },
-        .ge => .{ .bool = a >= b },
-        .eq => .{ .bool = a == b },
-        .ne => .{ .bool = a != b },
-        else => null,
+    // (A shift count keeps its own type.)
+    const b: i64 = if (shift) rv else wrapInt(sc, rv);
+    // 32-bit and narrower values are extended by their sign, so 64-bit
+    // signed arithmetic is theirs; only uint64 needs unsigned operations.
+    const ua: u64 = @bitCast(a);
+    const ub: u64 = @bitCast(b);
+    const unsigned64 = sc == .uint64;
+    const v: i64 = switch (op) {
+        .add => a +% b,
+        .sub => a -% b,
+        .mul => a *% b,
+        .div => if (b == 0) return null else if (unsigned64) @bitCast(ua / ub) else if (b == -1) -%a else @divTrunc(a, b),
+        .rem => if (b == 0) return null else if (unsigned64) @bitCast(ua % ub) else if (b == -1) 0 else @rem(a, b),
+        .shl => if (b < 0 or b >= 64) 0 else a << @intCast(b),
+        .shr => if (b < 0 or b >= 64) 0 else if (unsigned64) @bitCast(ua >> @intCast(b)) else a >> @intCast(b),
+        .bit_and => a & b,
+        .bit_or => a | b,
+        .bit_xor => a ^ b,
+        .lt => return .{ .bool = if (unsigned64) ua < ub else a < b },
+        .gt => return .{ .bool = if (unsigned64) ua > ub else a > b },
+        .le => return .{ .bool = if (unsigned64) ua <= ub else a <= b },
+        .ge => return .{ .bool = if (unsigned64) ua >= ub else a >= b },
+        .eq => return .{ .bool = a == b },
+        .ne => return .{ .bool = a != b },
+        else => return null,
     };
+    return .{ .int = wrapInt(sc, v) };
 }
 
 pub fn parseIntLiteral(text: []const u8) ?i64 {
     if (text.len == 0) return null;
-    if (text[0] == '\'') return lexer.charValue(text);
-    // The digits alone, as for floats: whatever follows is the suffix.
-    const digits = text[0..scanLiteral(text).end];
-    var base: u8 = 10;
-    var body = digits;
-    if (isHexLiteral(digits)) {
-        base = 16;
-        body = digits[2..];
-    } else if (isBinaryLiteral(digits)) {
-        base = 2;
-        body = digits[2..];
-    } else if (digits.len > 1 and digits[0] == '0') {
-        base = 8;
-        body = digits[1..];
+    // A character constant is a `char` converted to uint: `'\xff'` is 0xFFFFFFFF.
+    if (text[0] == '\'') {
+        const c = literal.parseChar(text);
+        if (c.count == 0) return null;
+        return @as(u32, @truncate(@as(u64, @bitCast(c.value))));
     }
-    const v = std.fmt.parseInt(u64, body, base) catch return null;
-    return @bitCast(v);
+    // The digits alone, as for floats: whatever follows is the suffix.
+    const v = literal.parseDigits(text[0..scanLiteral(text).end]) orelse return null;
+    // dxc keeps 32 bits of a literal whose suffix makes it an int or a uint.
+    return switch (intLiteralType(text)) {
+        .int => @as(i32, @bitCast(@as(u32, @truncate(v)))),
+        .uint => @as(u32, @truncate(v)),
+        else => @bitCast(v),
+    };
 }
 
 pub fn parseFloatLiteral(text: []const u8) ?f64 {
@@ -4414,44 +4473,11 @@ pub fn parseFloatLiteral(text: []const u8) ?f64 {
     return std.fmt.parseFloat(f64, text[0..lit.end]) catch null;
 }
 
-const Literal = struct { end: usize, float: bool, inf: bool = false };
-
-/// The digits of a numeric literal (clang's NumericLiteralParser, with
-/// dxc's `.#INF`): where the suffix starts and whether it is floating.
-fn scanLiteral(text: []const u8) Literal {
-    var i: usize = 0;
-    if (isBinaryLiteral(text)) {
-        i = 2;
-        while (i < text.len and (text[i] == '0' or text[i] == '1')) i += 1;
-        return .{ .end = i, .float = false };
-    }
-    const hex = isHexLiteral(text);
-    if (hex) i = 2;
-    const isDigit = struct {
-        fn f(c: u8, h: bool) bool {
-            return if (h) std.ascii.isHex(c) else std.ascii.isDigit(c);
-        }
-    }.f;
-    while (i < text.len and isDigit(text[i], hex)) i += 1;
-    var float = false;
-    if (i < text.len and text[i] == '.') {
-        float = true;
-        i += 1;
-        while (i < text.len and isDigit(text[i], hex)) i += 1;
-    }
-    const exp_chars: []const u8 = if (hex) "pP" else "eE";
-    if (i < text.len and std.mem.indexOfScalar(u8, exp_chars, text[i]) != null) {
-        var j = i + 1;
-        if (j < text.len and (text[j] == '+' or text[j] == '-')) j += 1;
-        if (j < text.len and std.ascii.isDigit(text[j])) {
-            float = true;
-            i = j;
-            while (i < text.len and std.ascii.isDigit(text[i])) i += 1;
-        }
-    }
-    if (float and std.mem.startsWith(u8, text[i..], "#INF")) return .{ .end = i + 4, .float = true, .inf = true };
-    return .{ .end = i, .float = float };
-}
+const Literal = literal.Number;
+const scanLiteral = literal.scan;
+const isHexLiteral = literal.isHex;
+const isBinaryLiteral = literal.isBinary;
+const isIntSuffix = literal.isIntSuffix;
 
 /// Where an expression's text starts (clang's getBeginLoc): `i` in `i.T`.
 fn startLoc(e: *const ast.Expr) Loc {
@@ -4466,16 +4492,6 @@ fn startLoc(e: *const ast.Expr) Loc {
     };
 }
 
-/// `0x...`: a hexadecimal literal, integer or (with `p`) floating.
-fn isHexLiteral(text: []const u8) bool {
-    return text.len > 1 and text[0] == '0' and (text[1] == 'x' or text[1] == 'X');
-}
-
-/// `0b101`: a binary integer literal (clang accepts them in HLSL).
-fn isBinaryLiteral(text: []const u8) bool {
-    return text.len > 2 and text[0] == '0' and (text[1] == 'b' or text[1] == 'B') and (text[2] == '0' or text[2] == '1');
-}
-
 /// `f16` / `f32` / `f64` (any case) at the end of a float literal.
 fn fixedFloatSuffix(text: []const u8) ?[]const u8 {
     if (text.len < 4) return null;
@@ -4485,31 +4501,24 @@ fn fixedFloatSuffix(text: []const u8) ?[]const u8 {
     return null;
 }
 
-fn isIntSuffix(suffix: []const u8) bool {
-    const valid = [_][]const u8{ "", "u", "l", "ul", "lu", "ll", "ull", "llu" };
-    var buf: [3]u8 = undefined;
-    if (suffix.len > buf.len) return false;
-    const lower = std.ascii.lowerString(&buf, suffix);
-    for (valid) |v| if (std.mem.eql(u8, v, lower)) return true;
-    return false;
-}
-
 fn intLiteralType(text: []const u8) Scalar {
-    if (text.len > 0 and text[0] == '\'') return .literal_int;
+    // dxc: a `char` converted to uint.
+    if (text.len > 0 and text[0] == '\'') return .uint;
     var unsigned = false;
     var longs: u8 = 0;
     var i = text.len;
     while (i > 0) : (i -= 1) {
         switch (text[i - 1]) {
             'u', 'U' => unsigned = true,
-            'l', 'L' => longs += 1,
+            'l', 'L' => longs +|= 1,
             else => break,
         }
     }
-    // dxc: `l` is 32-bit, `ll` is 64-bit.
+    // dxc: `l` is 32-bit, `ll` is 64-bit; with an `l` and no `u`, only a
+    // decimal literal is signed (`0x1fl` and `0l` are uint).
     if (longs >= 2) return if (unsigned) .uint64 else .int64;
-    if (longs == 1) return if (unsigned) .uint else .int;
     if (unsigned) return .uint;
+    if (longs == 1) return if (literal.isDecimal(text)) .int else .uint;
     return .literal_int;
 }
 
@@ -4519,8 +4528,10 @@ fn floatLiteralType(text: []const u8) Scalar {
         '3' => .float,
         else => .double,
     };
-    const last = text[text.len - 1];
-    return switch (last) {
+    // The suffix alone: `1.#INF` ends in an `F` that is none.
+    const suffix = text[scanLiteral(text).end..];
+    if (suffix.len == 0) return .literal_float;
+    return switch (suffix[suffix.len - 1]) {
         'f', 'F' => .float,
         'h', 'H' => .half,
         'l', 'L' => .double,
@@ -4808,10 +4819,58 @@ test "literal suffixes" {
     try expectDiags(
         \\_Static_assert('a' == 97, "");
         \\_Static_assert('\n' == 10 && '\t' == 9 && '\\' == 92 && '\'' == 39, "");
-        \\_Static_assert('\x41' == 65 && '\101' == 65 && '\0' == 0, "");
+        \\_Static_assert('\x41' == 65 && '\101' == 65 && '\0' == 0 && '\e' == 27, "");
         \\static const int e = '';
     , .{}, &.{
-        "4: error: empty character constant",
+        "4: warning: empty character constant",
+        "4: error: expected expression",
+    });
+    // A character constant is a `char` converted to uint; what clang's
+    // CharLiteralParser rejects is an error, and so is more than one character.
+    try expectDiags(
+        \\_Static_assert(std::is_same<uint, __decltype('a')>::value, "");
+        \\_Static_assert('\xff' == 0xFFFFFFFF && '\377' == 0xFFFFFFFF && '\x7f' == 127, "");
+        \\static const uint a = '\x';
+        \\static const uint b = '\x141';
+        \\static const uint c = '\400';
+        \\static const uint d = 'ab';
+        \\static const uint e = '\1011';
+        \\static const uint f = '\q';
+        \\_Static_assert('\q' == 113, "");
+    , .{}, &.{
+        "3: error: \\x used with no following hex digits",
+        "4: error: hex escape sequence out of range",
+        "5: error: octal escape sequence out of range",
+        "6: warning: multi-character character constant",
+        "6: error: unsupported style of char literal - use a single-character char-based literal",
+        "7: warning: multi-character character constant",
+        "7: error: unsupported style of char literal - use a single-character char-based literal",
+        "8: warning: unknown escape sequence '\\q'",
+        "9: warning: unknown escape sequence '\\q'",
+    });
+    // A `u` or an `l` keeps 32 bits; with an `l` alone only a decimal
+    // literal is signed. The two letters of `ll` are alike.
+    try expectDiags(
+        \\_Static_assert(0xFFFFFFFFFFFFFFFFu == 0xFFFFFFFF && 4294967296u == 0 && 0x1FFFFFFFFl == 0xFFFFFFFF, "");
+        \\_Static_assert(std::is_same<int, __decltype(1l)>::value && std::is_same<uint, __decltype(0x1fl)>::value, "");
+        \\_Static_assert(std::is_same<uint, __decltype(0l)>::value && std::is_same<uint, __decltype(0777L)>::value, "");
+        \\_Static_assert(4294967295l == -1, "");
+        \\_Static_assert(std::is_same<int64_t, __decltype(1LL)>::value && std::is_same<uint64_t, __decltype(1uLL)>::value, "");
+        \\static const int64_t a = 1lL;
+        \\static const int64_t b = 1Llu;
+    , .{}, &.{
+        "6: error: invalid suffix 'lL' on integer constant",
+        "7: error: invalid suffix 'Llu' on integer constant",
+    });
+    // `1.#INF` has no suffix: the `F` is part of it.
+    try expectDiags(
+        \\float f(float x) { return 1; }
+        \\float f(double x) { return 2; }
+        \\float f(min16float x) { return 3; }
+        \\float g() { return f(1.#INF); }
+        \\float h() { return f(1.#INFf) + f(-1.#INFl); }
+    , .{}, &.{
+        "4: error: call to 'f' is ambiguous",
     });
     // Hex literals are floating only with a binary exponent; otherwise `f` is a digit.
     try expectDiags(
@@ -4888,6 +4947,57 @@ test "literal suffixes" {
         \\_Static_assert(std::is_same<half, float16_t>::value, "");
         \\_Static_assert(std::is_same<float16_t, __decltype(1.5h)>::value, "");
     , .{ .enable_16bit = true }, &.{});
+}
+
+test "constants fold in their type's width and signedness" {
+    // Operands convert to their common type and the result wraps to it,
+    // as dxc folds them (and as lowering computes them).
+    try expectDiags(
+        \\_Static_assert('\xff' + 1 == 0, "");
+        \\_Static_assert(4294967295l == 0xFFFFFFFFu, "");
+        \\_Static_assert(0xFFFFFFFFu + 1 == 0 && 0xFFFFFFFFu * 0xFFFFFFFFu == 1, "");
+        \\_Static_assert(~0u == 0xFFFFFFFF && (uint)-1 == 4294967295, "");
+        \\_Static_assert(!(-1 < 0u) && !(-1 < 0ull) && 1u - 2 > 0, "");
+        \\_Static_assert(2147483647 + 1 > 0, "");
+        \\_Static_assert((int)0xFFFFFFFF == -1 && (int)2.7 == 2 && (bool)5 == true, "");
+        \\_Static_assert(0x80000000u >> 31 == 1 && (int)0x80000000 >> 31 == -1, "");
+        \\_Static_assert((1u << 31) << 1 == 0, "");
+        \\_Static_assert(0xFFFFFFFFFFFFFFFFull / 2 == 0x7FFFFFFFFFFFFFFFull, "");
+        \\_Static_assert(-1 / 2u == 0x7FFFFFFF && -2147483648ll / -1 == 2147483648ll, "");
+        \\_Static_assert((float)1 / 2 == 0.5, "");
+        \\static const uint a = -1;
+        \\static const int b = 0xFFFFFFFF;
+        \\_Static_assert(a == 0xFFFFFFFF && b == -1, "");
+        \\static float c['\xff' + 2];
+        \\_Static_assert(sizeof(c) == 4, "");
+    , .{}, &.{});
+    // A suffix of any length is a diagnostic, in an array bound too.
+    const ls: [300]u8 = @splat('L');
+    try expectDiags("static float a[1" ++ &ls ++ "];", .{}, &.{
+        "1: error: invalid suffix '" ++ &ls ++ "' on integer constant",
+    });
+}
+
+test "universal character names in character constants" {
+    try expectDiags(
+        \\static const int a = '\u';
+        \\static const int b = '\u03b';
+        \\static const int c = '\u03b1';
+        \\static const int d = '\U000003B1';
+        \\static const int e = '\u0041';
+        \\static const int f = '\ud800';
+        \\static const int g = '\u0001';
+        \\static const int h = '\u0024';
+        \\_Static_assert(h == 36, "");
+    , .{}, &.{
+        "1: error: \\u used with no following hex digits",
+        "2: error: incomplete universal character name",
+        "3: error: character too large for enclosing character literal type",
+        "4: error: character too large for enclosing character literal type",
+        "5: error: character 'A' cannot be specified by a universal character name",
+        "6: error: invalid universal character",
+        "7: error: universal character name refers to a control character",
+    });
 }
 
 test "declaration modifiers" {

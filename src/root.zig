@@ -11,6 +11,7 @@ pub const front = struct {
     pub const source = @import("front/source.zig");
     pub const lexer = @import("front/lexer.zig");
     pub const unicode = @import("front/unicode.zig");
+    pub const literal = @import("front/literal.zig");
     pub const scan = @import("front/scan.zig");
     pub const preproc = @import("front/preproc.zig");
     pub const pp_print = @import("front/pp_print.zig");
