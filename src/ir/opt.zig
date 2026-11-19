@@ -976,7 +976,7 @@ pub fn fixPhis(a: Allocator, f: *ir.Function) Allocator.Error!void {
 /// calls, discards, appends and counters, mesh outputs, debug output and
 /// those writing through a pointer argument.
 pub fn isPureIntrinsic(f: *const ir.Function, name: []const u8, args: []const Ref) bool {
-    const effects = [_][]const u8{ "Interlocked", "Barrier", "clip", "abort", "printf", "errorf", "TraceRay", "ReportHit", "CallShader", "IgnoreHit", "AcceptHitAndEndSearch", "SetMeshOutputCounts", "DispatchMesh", "Store", "Append", "Consume", "IncrementCounter", "DecrementCounter", "discard", "WriteSamplerFeedback", "OutputComplete", "FinishedCrossGroupSharing", "Emit", "Cut", "Restart", "Proceed", "CommitNonOpaqueTriangleHit", "CommitProceduralPrimitiveHit", "Abort", "TraceRayInline", "hit_object", "HitObject", "MaybeReorderThread" };
+    const effects = [_][]const u8{ "Interlocked", "Barrier", "clip", "abort", "printf", "errorf", "TraceRay", "ReportHit", "CallShader", "IgnoreHit", "AcceptHitAndEndSearch", "SetMeshOutputCounts", "DispatchMesh", "Store", "Append", "Consume", "IncrementCounter", "DecrementCounter", "discard", "WriteSamplerFeedback", "OutputComplete", "FinishedCrossGroupSharing", "Emit", "Cut", "Restart", "Proceed", "CommitNonOpaqueTriangleHit", "CommitProceduralPrimitiveHit", "Abort", "TraceRayInline", "hit_object", "HitObject", "MaybeReorderThread", "ext_execution_mode" };
     for (effects) |e| if (std.mem.indexOf(u8, name, e) != null) return false;
     for (args) |arg| if (f.inst(arg).ptr != .none) return false;
     return true;
