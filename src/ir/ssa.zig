@@ -1561,7 +1561,11 @@ fn promote(m: *ir.Module, f: *ir.Function) Error!void {
             try out.append(a, r);
         }
         for (f.dbg_values.items[unplaced..]) |*dv| dv.pos = @intCast(out.items.len);
-        for (f.dbg_values.items[first_value..]) |*dv| dv.ctx = out.items;
+        // (A copy: the dead phis are taken out of `out` in place.)
+        if (f.dbg_values.items.len > first_value) {
+            const ctx = try a.dupe(Ref, out.items);
+            for (f.dbg_values.items[first_value..]) |*dv| dv.ctx = ctx;
+        }
         for (out.items) |r| {
             var hit = false;
             try forOperands(a, f.inst(r).op, Hit{ .repl = &repl, .hit = &hit });
@@ -1674,12 +1678,14 @@ fn removeDeadPhis(a: Allocator, f: *ir.Function) Error!void {
     }
     while (work.pop()) |r| for (f.inst(r).op.phi) |in| mk.use(in.value);
     for (f.blocks.items) |*blk| {
+        // (In one pass: a loop header of an unrolled Unreal shader has
+        // thousands of them.)
         var k: usize = 0;
-        while (k < blk.insts.items.len) {
-            const r = blk.insts.items[k];
-            if (f.inst(r).op == .phi and !live[r.index()]) {
-                _ = blk.insts.orderedRemove(k);
-            } else k += 1;
+        for (blk.insts.items) |r| {
+            if (f.inst(r).op == .phi and !live[r.index()]) continue;
+            blk.insts.items[k] = r;
+            k += 1;
         }
+        blk.insts.shrinkRetainingCapacity(k);
     }
 }
