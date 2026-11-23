@@ -965,7 +965,11 @@ const DepTest = struct {
     }
 };
 
-const expected_deps: []const []const u8 = &.{ "main.hlsl", "local.h", "inc/common.hlsli", "inc/sub/deep.h" };
+/// "common.hlsli" as found through `-I inc`: joined with the OS's separator,
+/// as dxc joins -I directories (the includes it makes in turn: with '/').
+const common_hlsli = "inc" ++ std.fs.path.sep_str ++ "common.hlsli";
+
+const expected_deps: []const []const u8 = &.{ "main.hlsl", "local.h", common_hlsli, "inc/sub/deep.h" };
 
 test "a compilation lists the files it read" {
     var t: DepTest = .{};
@@ -982,7 +986,7 @@ test "dependencies with in-memory source and after a compile error" {
     defer t.deinit();
     const r = try t.compile_(&.{ "-T", "ps_6_0", "-I", "inc" }, "#include \"common.hlsli\"\nfloat4 main() : SV_Target { return nope; }\n");
     try std.testing.expectEqual(Status.compile_failed, r.status);
-    try std.testing.expectEqualDeep(@as([]const []const u8, &.{ "hlsl.hlsl", "inc/common.hlsli", "inc/sub/deep.h" }), try t.paths(r.dependencies));
+    try std.testing.expectEqualDeep(@as([]const []const u8, &.{ "hlsl.hlsl", common_hlsli, "inc/sub/deep.h" }), try t.paths(r.dependencies));
     // A missing include is listed too, so a watcher can rebuild when it
     // appears (preprocessing stops at it: what follows is not listed).
     const m = try t.compile_(&.{ "-T", "ps_6_0", "-I", "inc" }, "#include \"local.h\"\n#include \"gen/missing.h\"\n#include \"common.hlsli\"\n");
@@ -996,7 +1000,7 @@ test "a root signature target lists the files it read" {
     const src = "#include \"local.h\"\n#include \"common.hlsli\"\n#define RS \"RootFlags(0)\"\n";
     const r = try t.compile_(&.{ "-T", "rootsig_1_1", "-E", "RS", "-I", "inc" }, src);
     try std.testing.expectEqual(Status.ok, r.status);
-    try std.testing.expectEqualDeep(@as([]const []const u8, &.{ "hlsl.hlsl", "local.h", "inc/common.hlsli", "inc/sub/deep.h" }), try t.paths(r.dependencies));
+    try std.testing.expectEqualDeep(@as([]const []const u8, &.{ "hlsl.hlsl", "local.h", common_hlsli, "inc/sub/deep.h" }), try t.paths(r.dependencies));
     // Also when the macro is not a root signature.
     const bad = try t.compile_(&.{ "-T", "rootsig_1_1", "-E", "RS", "-I", "inc" }, "#include \"local.h\"\n#define RS 1\n");
     try std.testing.expectEqual(Status.compile_failed, bad.status);
@@ -1041,7 +1045,7 @@ test "root signature macros are read with the target's predefined macros" {
 test "-M, -MD and -MF give dxc's make rule" {
     var t: DepTest = .{};
     defer t.deinit();
-    const rule = "out.dxil: main.hlsl \\\n local.h \\\n inc/common.hlsli \\\n inc/sub/deep.h\n";
+    const rule = "out.dxil: main.hlsl \\\n local.h \\\n " ++ common_hlsli ++ " \\\n inc/sub/deep.h\n";
     const m = try t.compile_(&.{ "-T", "ps_6_0", "-I", "inc", "-M", "main.hlsl", "-Fo", "out.dxil" }, null);
     try std.testing.expectEqual(Status.ok, m.status);
     try std.testing.expect(m.object == null);
@@ -1060,8 +1064,8 @@ test "-M, -MD and -MF give dxc's make rule" {
     // rule lists it as spelled, as do the dependencies (marked missing).
     const bad = try t.compile_(&.{ "-T", "ps_6_0", "-I", "inc", "-M" }, "#include \"local.h\"\n#include \"missing.h\"\n#error stop\n#include \"missing.h\"\n#include \"common.hlsli\"\n");
     try std.testing.expectEqual(Status.compile_failed, bad.status);
-    try std.testing.expectEqualStrings("hlsl.hlsl: hlsl.hlsl \\\n local.h \\\n missing.h \\\n inc/common.hlsli \\\n inc/sub/deep.h\n", bad.dependency_rule.?);
-    try std.testing.expectEqualDeep(@as([]const []const u8, &.{ "hlsl.hlsl", "local.h", "missing:missing.h", "inc/common.hlsli", "inc/sub/deep.h" }), try t.paths(bad.dependencies));
+    try std.testing.expectEqualStrings("hlsl.hlsl: hlsl.hlsl \\\n local.h \\\n missing.h \\\n " ++ common_hlsli ++ " \\\n inc/sub/deep.h\n", bad.dependency_rule.?);
+    try std.testing.expectEqualDeep(@as([]const []const u8, &.{ "hlsl.hlsl", "local.h", "missing:missing.h", common_hlsli, "inc/sub/deep.h" }), try t.paths(bad.dependencies));
     // Only the first error is reported (the rest come after a fatal one).
     try std.testing.expect(std.mem.indexOf(u8, bad.diagnostics, "stop") == null);
 
