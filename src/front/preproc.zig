@@ -37,6 +37,18 @@ pub const Options = struct {
     /// Preprocessing only (-P): stray Unicode is passed through rather than
     /// diagnosed, as by dxc.
     preprocess_only: bool = false,
+    /// Keep preprocessing after a fatal error (with its later diagnostics
+    /// suppressed), as clang's preprocessor does: dxc's -M lists the
+    /// includes after a missing one.
+    keep_going: bool = false,
+};
+
+/// A file the main file depends on, as clang's dependency collector (which
+/// dxc's -M uses) records it: each #include as resolved, whether entered
+/// or skipped (include guard, #pragma once), and a missing one as spelled.
+pub const Dependency = struct {
+    path: []const u8,
+    missing: bool = false,
 };
 
 const Builtin = enum {
@@ -157,8 +169,15 @@ pub const Preprocessor = struct {
     pragma_once: std.StringHashMapUnmanaged(void) = .empty,
     counter: u32 = 0,
     main_file: ?source.FileId = null,
+    /// The main file and every #include, in order, with repeats.
+    /// Compiled-in headers are not files and are left out.
+    deps: std.ArrayList(Dependency) = .empty,
     isolated_depth: u32 = 0,
     nesting_reported: bool = false,
+    /// An #include went past max_include_depth: no later #include is
+    /// entered (as clang), or a file including itself twice would be read
+    /// 2^depth times before preprocessing ended.
+    include_depth_reached: bool = false,
 
     const Raw = struct { tok: Token, from_file: bool };
 
@@ -175,18 +194,47 @@ pub const Preprocessor = struct {
             pp.diags.err(.none, "cannot open file '{s}'", .{path});
             return false;
         };
-        try pp.enterFileId(id);
-        pp.main_file = id;
-        try pp.enterPredefines();
+        try pp.enterMain(id);
         return true;
     }
 
-    /// Enter in-memory main file text (used by tests and the library API).
+    /// Enter in-memory main file text (used by tests).
     pub fn enterMainText(pp: *Preprocessor, path: []const u8, text: []const u8) !void {
-        const id = try pp.sm.addFile(path, text);
+        try pp.enterMain(try pp.sm.addFile(path, text));
+    }
+
+    fn enterMain(pp: *Preprocessor, id: source.FileId) !void {
+        try pp.deps.append(pp.arena, .{ .path = pp.sm.file(id).path });
         try pp.enterFileId(id);
         pp.main_file = id;
         try pp.enterPredefines();
+    }
+
+    /// The full expansion of macro `name` as it is defined at the end of
+    /// the input, as if `name` were written there: for a root signature
+    /// named by a macro (-T rootsig_1_x -E, -rootsig-define). Call after
+    /// `next` returned eof. An undefined name comes back unexpanded.
+    pub fn expandAtEnd(pp: *Preprocessor, name: []const u8) Error![]Token {
+        // (After a fatal error nothing is produced, so nothing to expand.)
+        if (pp.halted()) return &.{};
+        // Invoked at the end of the main file (where diagnostics about
+        // the expansion point).
+        const main = pp.main_file.?;
+        const end: Loc = .{ .file = main, .offset = @intCast(pp.sm.file(main).text.len) };
+        return pp.expandIsolated(&.{.{ .kind = .identifier, .text = name, .loc = end }});
+    }
+
+    /// Where macro `name` is defined (its name in the #define), if it is
+    /// defined in a file, else none.
+    pub fn macroLoc(pp: *const Preprocessor, name: []const u8) Loc {
+        const m = pp.macros.get(name) orelse return .none;
+        return m.loc;
+    }
+
+    /// Stopped by a fatal error (or too many errors): nothing more is
+    /// produced, unless `keep_going`.
+    fn halted(pp: *const Preprocessor) bool {
+        return pp.diags.stopped and !pp.opts.keep_going;
     }
 
     fn enterFileId(pp: *Preprocessor, id: source.FileId) !void {
@@ -285,7 +333,7 @@ pub const Preprocessor = struct {
 
     fn lexRaw(pp: *Preprocessor) Error!Raw {
         // After a fatal error (or too many errors) nothing more is produced.
-        if (pp.diags.stopped) return .{ .tok = .{ .kind = .eof, .text = "", .loc = .none }, .from_file = true };
+        if (pp.halted()) return .{ .tok = .{ .kind = .eof, .text = "", .loc = .none }, .from_file = true };
         if (pp.pushback.pop()) |r| return r;
         while (pp.contexts.items.len > 0) {
             const ctx = &pp.contexts.items[pp.contexts.items.len - 1];
@@ -1029,11 +1077,14 @@ pub const Preprocessor = struct {
             }
         }
 
+        if (pp.include_depth_reached) return;
         if (pp.includes.items.len >= max_include_depth) {
+            pp.include_depth_reached = true;
             pp.diags.err(directive.loc, "#include nested too deeply", .{});
             return;
         }
         const id = try pp.resolveInclude(spelled, angled) orelse {
+            try pp.deps.append(pp.arena, .{ .path = spelled, .missing = true });
             const r: Report = .{ .severity = .fatal, .loc = name_loc, .len = name_len };
             if (angled and try pp.resolveInclude(spelled, false) != null) {
                 _ = pp.diags.report(r, "'{s}' file not found with <angled> include; use \"quotes\" instead", .{spelled});
@@ -1042,6 +1093,8 @@ pub const Preprocessor = struct {
             }
             return;
         };
+        const included = pp.sm.file(id).path;
+        if (!std.mem.startsWith(u8, included, embedded_prefix)) try pp.deps.append(pp.arena, .{ .path = included });
         // Multiple-include optimization: a guarded file whose guard macro is
         // defined would contribute nothing, so do not even enter it.
         if (includeGuard(pp.sm.allocator(), pp.sm.file(id).content)) |guard| {
@@ -1570,6 +1623,19 @@ test "include, pragma once, line, builtins" {
     defer t.deinit();
     try std.testing.expectEqualStrings("int inc ; int sys ; int l = 50 ; \"x.hlsl\" #pragma pack_matrix(row_major)", try t.output());
     try std.testing.expectEqual(@as(u32, 0), t.diags.error_count);
+}
+
+test "a file including itself twice ends at the include depth limit" {
+    // Also with keep_going (-M), which preprocesses on after errors.
+    for ([_]bool{ false, true }) |keep_going| {
+        var t: TestPP = .{};
+        try t.init(&.{.{ "./self.h", "#include \"self.h\"\n#include \"self.h\"\nx\n" }}, "#include \"self.h\"\n", .{ .keep_going = keep_going });
+        defer t.deinit();
+        _ = try t.output();
+        var deep: usize = 0;
+        for (t.diags.list.items) |d| deep += @intFromBool(std.mem.eql(u8, d.message, "#include nested too deeply"));
+        try std.testing.expectEqual(@as(usize, 1), deep);
+    }
 }
 
 test "errors are diagnosed" {
