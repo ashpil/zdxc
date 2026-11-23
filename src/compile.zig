@@ -902,10 +902,12 @@ fn depFileName(arena: std.mem.Allocator, input: []const u8) ![]const u8 {
 }
 
 /// `deps` each once, without a leading "./" (as clang's dependency
-/// collector, which dxc uses).
+/// collector, which dxc uses). Paths that differ only in which of the
+/// OS's separators they use are one file ("inc/a.h" and, on Windows,
+/// "inc\a.h"): listed once, as first spelled.
 fn dependencyList(arena: std.mem.Allocator, deps: []const Dependency) ![]const Dependency {
     var list: std.ArrayList(Dependency) = .empty;
-    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    var seen: std.HashMapUnmanaged([]const u8, void, SamePath, std.hash_map.default_max_load_percentage) = .empty;
     for (deps) |d| {
         const p = stripDotSlash(d.path);
         // (The paths live in the source manager or the preprocessor's
@@ -915,6 +917,25 @@ fn dependencyList(arena: std.mem.Allocator, deps: []const Dependency) ![]const D
     }
     return list.items;
 }
+
+/// Hash map context: paths compared with every separator of the OS alike.
+const SamePath = struct {
+    pub fn hash(_: SamePath, path: []const u8) u64 {
+        var h: std.hash.Wyhash = .init(0);
+        for (path) |c| h.update(&.{fold(c)});
+        return h.final();
+    }
+
+    pub fn eql(_: SamePath, a: []const u8, b: []const u8) bool {
+        if (a.len != b.len) return false;
+        for (a, b) |x, y| if (fold(x) != fold(y)) return false;
+        return true;
+    }
+
+    fn fold(c: u8) u8 {
+        return if (std.fs.path.isSep(c)) '/' else c;
+    }
+};
 
 fn stripDotSlash(path: []const u8) []const u8 {
     var p = path;
@@ -1072,6 +1093,18 @@ test "-M, -MD and -MF give dxc's make rule" {
     // -M needs a target, as in dxc.
     const no_t = try t.compile_(&.{ "-M", "main.hlsl" }, null);
     try std.testing.expectEqual(Status.failed, no_t.status);
+}
+
+test "a file reached with either separator is one dependency" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    // (On Windows "inc\a.h"; elsewhere '\' is no separator, and the two
+    // spellings are the same string.)
+    const native = "inc" ++ std.fs.path.sep_str ++ "a.h";
+    const deps = try dependencyList(arena.allocator(), &.{ .{ .path = "main.hlsl" }, .{ .path = "inc/a.h" }, .{ .path = "./" ++ native }, .{ .path = "inc/b.h" }, .{ .path = native } });
+    try std.testing.expectEqual(@as(usize, 3), deps.len);
+    try std.testing.expectEqualStrings("inc/a.h", deps[1].path);
+    try std.testing.expectEqualStrings("inc/b.h", deps[2].path);
 }
 
 test "depFileName and stripDotSlash" {
