@@ -174,6 +174,10 @@ pub const Preprocessor = struct {
     deps: std.ArrayList(Dependency) = .empty,
     isolated_depth: u32 = 0,
     nesting_reported: bool = false,
+    /// An #include went past max_include_depth: no later #include is
+    /// entered (as clang), or a file including itself twice would be read
+    /// 2^depth times before preprocessing ended.
+    include_depth_reached: bool = false,
 
     const Raw = struct { tok: Token, from_file: bool };
 
@@ -1073,7 +1077,9 @@ pub const Preprocessor = struct {
             }
         }
 
+        if (pp.include_depth_reached) return;
         if (pp.includes.items.len >= max_include_depth) {
+            pp.include_depth_reached = true;
             pp.diags.err(directive.loc, "#include nested too deeply", .{});
             return;
         }
@@ -1617,6 +1623,19 @@ test "include, pragma once, line, builtins" {
     defer t.deinit();
     try std.testing.expectEqualStrings("int inc ; int sys ; int l = 50 ; \"x.hlsl\" #pragma pack_matrix(row_major)", try t.output());
     try std.testing.expectEqual(@as(u32, 0), t.diags.error_count);
+}
+
+test "a file including itself twice ends at the include depth limit" {
+    // Also with keep_going (-M), which preprocesses on after errors.
+    for ([_]bool{ false, true }) |keep_going| {
+        var t: TestPP = .{};
+        try t.init(&.{.{ "./self.h", "#include \"self.h\"\n#include \"self.h\"\nx\n" }}, "#include \"self.h\"\n", .{ .keep_going = keep_going });
+        defer t.deinit();
+        _ = try t.output();
+        var deep: usize = 0;
+        for (t.diags.list.items) |d| deep += @intFromBool(std.mem.eql(u8, d.message, "#include nested too deeply"));
+        try std.testing.expectEqual(@as(usize, 1), deep);
+    }
 }
 
 test "errors are diagnosed" {
